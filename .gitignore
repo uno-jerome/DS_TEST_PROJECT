@@ -31,3 +31,4 @@ stocks_*.csv
 # Logs and temporary files
 *.log
 *.tmp
+plan.md

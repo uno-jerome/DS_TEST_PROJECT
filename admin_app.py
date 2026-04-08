@@ -43,12 +43,30 @@ def center_window(win, width, height):
     y = (screen_height / 2) - (height / 2)
     win.geometry(f'{width}x{height}+{int(x)}+{int(y)}')
 
+
+def maximize_window(win):
+    try:
+        win.state("zoomed")
+        return
+    except tk.TclError:
+        pass
+
+    try:
+        win.attributes("-zoomed", True)
+        return
+    except tk.TclError:
+        pass
+
+    try:
+        screen_width = win.winfo_screenwidth()
+        screen_height = win.winfo_screenheight()
+        win.geometry(f"{screen_width}x{screen_height}+0+0")
+    except Exception:
+        pass
+
 center_window(window, 1180, 820)
 window.minsize(1080, 720)
-try:
-    window.state("zoomed")
-except tk.TclError:
-    pass
+maximize_window(window)
 
 # Hide main window initially for the gatekeeper
 window.withdraw()
@@ -63,24 +81,18 @@ login_window.configure(fg_color=PALETTE_DARK)
 header_font=ctk.CTkFont(size=20, weight="bold")
 
 def check_login(event=None):
-    username = username_entry.get()
+    username = username_entry.get().strip()
     password = password_entry.get()
     
-    if not username.strip() or not password.strip():
+    if not username or not password.strip():
         messagebox.showwarning("Error", "Please enter both username and password.")
         return
 
-    cursor.connection.ping()
-    cursor.execute(
-        """
-        SELECT id, username, password, COALESCE(failed_login_count, 0),
-               COALESCE(account_locked, 0), locked_until
-        FROM users
-        WHERE username = %s
-        """,
-        (username.strip(),),
-    )
-    user = cursor.fetchone()
+    try:
+        user = admin_data.fetch_admin_for_login(conn, username)
+    except Exception as login_error:
+        messagebox.showerror("Error", f"Database error: {login_error}")
+        return
 
     if not user:
         messagebox.showerror("Error", "Invalid username or password.")
@@ -101,28 +113,14 @@ def check_login(event=None):
         new_failed_count = int(failed_count or 0) + 1
         if new_failed_count >= MAX_ADMIN_LOGIN_ATTEMPTS:
             lock_until = current_time + timedelta(minutes=ADMIN_LOCK_MINUTES)
-            cursor.execute(
-                """
-                UPDATE users
-                SET failed_login_count=%s, last_failed_login=%s, account_locked=1, locked_until=%s
-                WHERE id=%s
-                """,
-                (new_failed_count, current_time, lock_until, user_id),
-            )
+            admin_data.mark_admin_login_locked(conn, user_id, new_failed_count, current_time, lock_until)
             conn.commit()
             messagebox.showerror(
                 "Account Locked",
                 f"Too many failed attempts. Account locked for {ADMIN_LOCK_MINUTES} minutes.",
             )
         else:
-            cursor.execute(
-                """
-                UPDATE users
-                SET failed_login_count=%s, last_failed_login=%s
-                WHERE id=%s
-                """,
-                (new_failed_count, current_time, user_id),
-            )
+            admin_data.mark_admin_login_failed(conn, user_id, new_failed_count, current_time)
             conn.commit()
             remaining_attempts = MAX_ADMIN_LOGIN_ATTEMPTS - new_failed_count
             messagebox.showerror("Error", f"Invalid username or password. {remaining_attempts} attempt(s) left.")
@@ -130,23 +128,9 @@ def check_login(event=None):
 
     if needs_password_upgrade(stored_password_hash):
         upgraded_password = hash_password(password)
-        cursor.execute(
-            """
-            UPDATE users
-            SET password=%s, failed_login_count=0, last_failed_login=NULL, account_locked=0, locked_until=NULL
-            WHERE id=%s
-            """,
-            (upgraded_password, user_id),
-        )
+        admin_data.reset_admin_login_status(conn, user_id, upgraded_password)
     else:
-        cursor.execute(
-            """
-            UPDATE users
-            SET failed_login_count=0, last_failed_login=NULL, account_locked=0, locked_until=NULL
-            WHERE id=%s
-            """,
-            (user_id,),
-        )
+        admin_data.reset_admin_login_status(conn, user_id)
     conn.commit()
 
     messagebox.showinfo("Success", "Welcome, Admin!")
@@ -157,6 +141,7 @@ def check_login(event=None):
     except NameError:
         pass                # Ignore if refresh_orders isn't defined yet
     window.deiconify()      # Show the Main Inventory System
+    maximize_window(window)
 
 login_frame = ctk.CTkFrame(login_window, fg_color=PALETTE_DARK, corner_radius=0)
 login_frame.pack(padx=0, pady=0, fill="both", expand=True)
@@ -260,7 +245,6 @@ conn = get_session_connection("admin-ui") or connectDB()
 if not conn:
     messagebox.showerror("Database Error", "Could not connect to the database.")
     raise SystemExit(1)
-cursor = conn.cursor()
 
 # reading the data from sqlyog
 def read():

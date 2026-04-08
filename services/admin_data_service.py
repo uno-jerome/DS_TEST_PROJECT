@@ -172,6 +172,67 @@ def fetch_order_detail_items(conn, order_id):
     return cur.fetchall()
 
 
+def fetch_admin_for_login(conn, username):
+    cur = _get_cursor(conn)
+    cur.execute(
+        """
+        SELECT id, username, password, COALESCE(failed_login_count, 0),
+               COALESCE(account_locked, 0), locked_until
+        FROM users
+        WHERE username = %s
+        """,
+        (username,),
+    )
+    return cur.fetchone()
+
+
+def mark_admin_login_locked(conn, user_id, failed_count, current_time, locked_until):
+    cur = _get_cursor(conn)
+    cur.execute(
+        """
+        UPDATE users
+        SET failed_login_count=%s, last_failed_login=%s, account_locked=1, locked_until=%s
+        WHERE id=%s
+        """,
+        (failed_count, current_time, locked_until, user_id),
+    )
+
+
+def mark_admin_login_failed(conn, user_id, failed_count, current_time):
+    cur = _get_cursor(conn)
+    cur.execute(
+        """
+        UPDATE users
+        SET failed_login_count=%s, last_failed_login=%s
+        WHERE id=%s
+        """,
+        (failed_count, current_time, user_id),
+    )
+
+
+def reset_admin_login_status(conn, user_id, new_password_hash=None):
+    cur = _get_cursor(conn)
+    if new_password_hash:
+        cur.execute(
+            """
+            UPDATE users
+            SET password=%s, failed_login_count=0, last_failed_login=NULL, account_locked=0, locked_until=NULL
+            WHERE id=%s
+            """,
+            (new_password_hash, user_id),
+        )
+        return
+
+    cur.execute(
+        """
+        UPDATE users
+        SET failed_login_count=0, last_failed_login=NULL, account_locked=0, locked_until=NULL
+        WHERE id=%s
+        """,
+        (user_id,),
+    )
+
+
 def fetch_admin_user(conn, username):
     cur = _get_cursor(conn)
     cur.execute("SELECT id, password FROM users WHERE username=%s", (username,))

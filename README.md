@@ -37,13 +37,13 @@ CREATE DATABASE itc_database_admin;
 - Start admin app:
 
 ```bash
-python main.py
+python admin_app.py
 ```
 
 - Start shop app:
 
 ```bash
-python shop.py
+python buyer_app.py
 ```
 
 ## Default admin login

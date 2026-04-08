@@ -1,12 +1,14 @@
 import os
-import json
 import tkinter as tk
 from tkinter import ttk, messagebox
 import customtkinter as ctk
 import time
 from datetime import datetime, timedelta
-from urllib.parse import unquote, urlparse
 from database import connectDB, setup_database, get_session_connection, close_session_connection
+from services import buyer_data_service as buyer_data
+from services import buyer_state_service as buyer_state
+from services import buyer_utils
+from services.format_utils import parse_price_input, format_price_display
 from security_utils import (
     hash_password,
     needs_password_upgrade,
@@ -38,117 +40,8 @@ PALETTE_TEXT = "#E8FFF5"
 SHOP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shop_state.json")
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
-
-def parse_price_input(raw_price):
-    cleaned_price = str(raw_price).replace(",", "").replace("₱", "").replace("P", "").strip()
-    if not cleaned_price:
-        raise ValueError("Price is empty")
-    return float(cleaned_price)
-
-def format_price_display(value):
-    try:
-        numeric_value = float(str(value).replace(",", "").replace("₱", "").replace("P", "").strip())
-        if numeric_value.is_integer():
-            return f"{int(numeric_value):,}"
-        return f"{numeric_value:,.2f}"
-    except Exception:
-        return str(value)
-
-
-def parse_specs_lines(specs_raw):
-    if not specs_raw:
-        return []
-
-    try:
-        parsed_specs = json.loads(specs_raw)
-        if isinstance(parsed_specs, dict):
-            return [f"{key}: {value}" for key, value in parsed_specs.items()]
-        if isinstance(parsed_specs, list):
-            return [str(item) for item in parsed_specs if str(item).strip()]
-    except Exception:
-        pass
-
-    return [line.strip() for line in str(specs_raw).splitlines() if line.strip()]
-
-
-def resolve_product_image_path(raw_path):
-    image_path = str(raw_path or "").strip().strip('"').strip("'")
-    if not image_path:
-        return ""
-
-    candidate_paths = []
-
-    # Support file:// URIs and decode URL-encoded local paths.
-    if image_path.lower().startswith("file://"):
-        parsed_uri = urlparse(image_path)
-        decoded_path = unquote(parsed_uri.path or "")
-        if os.name == "nt" and decoded_path.startswith("/"):
-            decoded_path = decoded_path[1:]
-        if decoded_path:
-            candidate_paths.append(decoded_path)
-
-    candidate_paths.append(image_path)
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    if not os.path.isabs(image_path):
-        candidate_paths.append(os.path.join(script_dir, image_path))
-        candidate_paths.append(os.path.join(script_dir, "images", image_path))
-        candidate_paths.append(os.path.join(script_dir, "assets", image_path))
-
-    seen_paths = set()
-    for candidate in candidate_paths:
-        normalized = os.path.normpath(os.path.expanduser(candidate))
-        if normalized in seen_paths:
-            continue
-        seen_paths.add(normalized)
-        if os.path.exists(normalized):
-            return normalized
-
-    return ""
-
-
-def fetch_product_details(item_id):
-    try:
-        conn = get_session_connection("shop-read")
-        if not conn:
-            return None
-
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                s.item_id,
-                s.name,
-                s.price,
-                s.quantity,
-                s.category,
-                pd.description,
-                pd.specs_json,
-                pd.image_path,
-                pd.return_policy_text
-            FROM stocks s
-            LEFT JOIN product_details pd ON pd.item_id = s.item_id
-            WHERE s.item_id = %s
-            """,
-            (item_id,),
-        )
-        row = cur.fetchone()
-        if not row:
-            return None
-
-        return {
-            "item_id": row[0],
-            "name": row[1],
-            "price": row[2],
-            "quantity": row[3],
-            "category": row[4],
-            "description": row[5],
-            "specs_json": row[6],
-            "image_path": row[7],
-            "return_policy_text": row[8],
-        }
-    except Exception:
-        return None
+SHOP_READ_SESSION = "shop-read"
+SHOP_AUTH_SESSION = "shop-auth"
 
 # Current user session variable
 current_customer = {
@@ -160,39 +53,14 @@ current_customer = {
 }
 
 def default_shop_state():
-    return {
-        "remember_me": False,
-        "remembered_email": "",
-        "cart_cache": {}
-    }
+    return buyer_state.default_shop_state()
 
 def load_shop_state():
-    if not os.path.exists(SHOP_STATE_FILE):
-        return default_shop_state()
-
-    try:
-        with open(SHOP_STATE_FILE, "r", encoding="utf-8") as state_file:
-            loaded_state = json.load(state_file)
-            if not isinstance(loaded_state, dict):
-                return default_shop_state()
-
-            loaded_state.setdefault("remember_me", False)
-            loaded_state.setdefault("remembered_email", "")
-            loaded_state.setdefault("cart_cache", {})
-
-            if not isinstance(loaded_state["cart_cache"], dict):
-                loaded_state["cart_cache"] = {}
-
-            return loaded_state
-    except Exception:
-        return default_shop_state()
+    return buyer_state.load_shop_state(SHOP_STATE_FILE)
 
 def save_shop_state():
-    try:
-        with open(SHOP_STATE_FILE, "w", encoding="utf-8") as state_file:
-            json.dump(shop_state, state_file, indent=2)
-    except Exception as state_error:
-        print(f"Warning: Could not save shop state: {state_error}")
+    if not buyer_state.save_shop_state(SHOP_STATE_FILE, shop_state):
+        print("Warning: Could not save shop state.")
 
 def get_current_cart_owner_key():
     owner_email = str(current_customer.get("email") or "").strip().lower()
@@ -281,15 +149,33 @@ def center_window(win, width, height):
     y = (screen_height / 2) - (height / 2)
     win.geometry(f'{width}x{height}+{int(x)}+{int(y)}')
 
+
+def maximize_window(win):
+    try:
+        win.state("zoomed")
+        return
+    except tk.TclError:
+        pass
+
+    try:
+        win.attributes("-zoomed", True)
+        return
+    except tk.TclError:
+        pass
+
+    try:
+        screen_width = win.winfo_screenwidth()
+        screen_height = win.winfo_screenheight()
+        win.geometry(f"{screen_width}x{screen_height}+0+0")
+    except Exception:
+        pass
+
 # Initialize Main Shop Window (Hidden Initially)
 shop = ctk.CTk()
 shop.title("E-Commerce User Storefront")
 center_window(shop, 1260, 840)
 shop.minsize(1100, 760)
-try:
-    shop.state("zoomed")
-except tk.TclError:
-    pass
+maximize_window(shop)
 shop.configure(fg_color=PALETTE_DARKEST)
 shop.withdraw()
 
@@ -331,6 +217,12 @@ reg_contact_var = tk.StringVar()
 
 shop_state = load_shop_state()
 
+auth_session_start = time.perf_counter()
+if get_session_connection(SHOP_AUTH_SESSION):
+    print(f"[startup] Shop auth session ready: {(time.perf_counter() - auth_session_start) * 1000:.1f}ms")
+else:
+    print("[startup] Shop auth session unavailable (will retry on login).")
+
 # Font config
 MAIN_FONT = ("Segoe UI", 10)
 TITLE_FONT = ("Segoe UI", 16, "bold")
@@ -338,30 +230,20 @@ BTN_BG = "#0e62a0"
 BTN_FG = "white"
 
 def handle_login():
+    login_start = time.perf_counter()
     email = login_email_var.get().strip().lower()
     pw = login_pw_var.get().strip()
     if not email or not pw:
         messagebox.showwarning("Error", "Please enter both email and password", parent=auth_win)
         return
 
-    conn = None
     try:
-        conn = connectDB()
+        conn = get_session_connection(SHOP_AUTH_SESSION)
         if not conn:
             messagebox.showerror("Error", "Database connection is unavailable.", parent=auth_win)
             return
 
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT id, email, name, contact_number, address, password_hash,
-                   COALESCE(failed_login_count, 0), COALESCE(account_locked, 0), locked_until
-            FROM customers
-            WHERE email = %s
-            """,
-            (email,),
-        )
-        user = cur.fetchone()
+        user = buyer_data.fetch_customer_for_login(conn, email)
 
         if not user:
             messagebox.showerror("Login Failed", "Invalid email or password", parent=auth_win)
@@ -383,14 +265,7 @@ def handle_login():
             new_failed_count = int(failed_count or 0) + 1
             if new_failed_count >= MAX_LOGIN_ATTEMPTS:
                 lock_until = current_time + timedelta(minutes=LOGIN_LOCK_MINUTES)
-                cur.execute(
-                    """
-                    UPDATE customers
-                    SET failed_login_count=%s, last_failed_login=%s, account_locked=1, locked_until=%s
-                    WHERE id=%s
-                    """,
-                    (new_failed_count, current_time, lock_until, customer_id),
-                )
+                buyer_data.mark_customer_login_locked(conn, customer_id, new_failed_count, current_time, lock_until)
                 conn.commit()
                 messagebox.showerror(
                     "Account Locked",
@@ -398,14 +273,7 @@ def handle_login():
                     parent=auth_win,
                 )
             else:
-                cur.execute(
-                    """
-                    UPDATE customers
-                    SET failed_login_count=%s, last_failed_login=%s
-                    WHERE id=%s
-                    """,
-                    (new_failed_count, current_time, customer_id),
-                )
+                buyer_data.mark_customer_login_failed(conn, customer_id, new_failed_count, current_time)
                 conn.commit()
                 remaining_attempts = MAX_LOGIN_ATTEMPTS - new_failed_count
                 messagebox.showerror(
@@ -417,23 +285,9 @@ def handle_login():
 
         if needs_password_upgrade(db_password_hash):
             upgraded_hash = hash_password(pw)
-            cur.execute(
-                """
-                UPDATE customers
-                SET password_hash=%s, failed_login_count=0, last_failed_login=NULL, account_locked=0, locked_until=NULL
-                WHERE id=%s
-                """,
-                (upgraded_hash, customer_id),
-            )
+            buyer_data.reset_customer_login_status(conn, customer_id, upgraded_hash)
         else:
-            cur.execute(
-                """
-                UPDATE customers
-                SET failed_login_count=0, last_failed_login=NULL, account_locked=0, locked_until=NULL
-                WHERE id=%s
-                """,
-                (customer_id,),
-            )
+            buyer_data.reset_customer_login_status(conn, customer_id)
         conn.commit()
 
         # Set global session
@@ -456,16 +310,16 @@ def handle_login():
         checkout_contact_lbl.configure(text=f"{current_customer['contact']}")
         checkout_addr_lbl.configure(text=f"{current_customer['address']}")
 
-        restore_cart_cache_for_current_user()
-        
         shop.deiconify() # Display shop
+        maximize_window(shop)
         shop.lift()
         shop.focus_force()
+
+        # Defer cart cache restore until after UI is visible for better perceived login speed.
+        shop.after_idle(restore_cart_cache_for_current_user)
+        print(f"[perf] Buyer login flow: {(time.perf_counter() - login_start) * 1000:.1f}ms")
     except Exception as e:
         messagebox.showerror("Error", f"Database error: {e}", parent=auth_win)
-    finally:
-        if conn:
-            conn.close()
 
 def handle_register():
     email = reg_email_var.get().strip().lower()
@@ -494,23 +348,17 @@ def handle_register():
     contact = "+63" + contact_raw
     hashed_pw = hash_password(pw)
     
-    conn = None
     try:
-        conn = connectDB()
+        conn = get_session_connection(SHOP_AUTH_SESSION)
         if not conn:
             messagebox.showerror("Error", "Database connection is unavailable.", parent=auth_win)
             return
 
-        cur = conn.cursor()
-        cur.execute("SELECT email FROM customers WHERE email=%s", (email,))
-        if cur.fetchone():
+        if buyer_data.customer_exists_by_email(conn, email):
             messagebox.showerror("Error", "Email is already registered", parent=auth_win)
             return
-            
-        cur.execute("""
-            INSERT INTO customers (email, password_hash, name, contact_number, address) 
-            VALUES (%s, %s, %s, %s, %s)
-        """, (email, hashed_pw, name, contact, address))
+
+        buyer_data.insert_customer(conn, email, hashed_pw, name, contact, address)
         conn.commit()
         
         messagebox.showinfo("Success", "Registration complete! You can now log in.", parent=auth_win)
@@ -519,17 +367,16 @@ def handle_register():
         login_pw_var.set("")
     except Exception as e:
         messagebox.showerror("Error", f"Registration error: {e}", parent=auth_win)
-    finally:
-        if conn:
-            conn.close()
 
 # --- Login UI ---
 ctk.CTkLabel(login_tab, text="Welcome Back!", font=ctk.CTkFont(size=26, weight="bold"), text_color=PALETTE_MINT).pack(pady=(20, 20))
 ctk.CTkLabel(login_tab, text="Email Address", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).pack(anchor="w", padx=40)
 
-ctk.CTkEntry(login_tab, textvariable=login_email_var, width=320, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text_color="#7FB8A3").pack(padx=40, pady=(5,10))
+login_email_entry = ctk.CTkEntry(login_tab, textvariable=login_email_var, width=320, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text_color="#7FB8A3")
+login_email_entry.pack(padx=40, pady=(5,10))
 ctk.CTkLabel(login_tab, text="Password", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).pack(anchor="w", padx=40, pady=(15, 5))
-ctk.CTkEntry(login_tab, textvariable=login_pw_var, show="•", width=320, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text_color="#7FB8A3").pack(padx=40, pady=(5,10))
+login_password_entry = ctk.CTkEntry(login_tab, textvariable=login_pw_var, show="•", width=320, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text_color="#7FB8A3")
+login_password_entry.pack(padx=40, pady=(5,10))
 ctk.CTkCheckBox(
     login_tab,
     text="Remember Me",
@@ -542,6 +389,18 @@ ctk.CTkCheckBox(
     checkmark_color=PALETTE_MINT
 ).pack(anchor="w", padx=40, pady=(8, 0))
 ctk.CTkButton(login_tab, text="Log In", font=ctk.CTkFont(size=16, weight="bold"), command=handle_login, width=320, height=50, corner_radius=10, fg_color=PALETTE_MINT, hover_color=PALETTE_PRIMARY, text_color=PALETTE_DARKEST).pack(pady=24)
+
+
+def handle_login_enter(event=None):
+    if auth_notebook.get() == "Login":
+        handle_login()
+        return "break"
+    return None
+
+
+login_email_entry.bind("<Return>", handle_login_enter)
+login_password_entry.bind("<Return>", handle_login_enter)
+auth_win.bind("<Return>", handle_login_enter)
 
 restore_login_preference()
 
@@ -588,29 +447,12 @@ def load_products(search_term="", category="All Categories"):
         products_tree.delete(data)
         
     try:
-        conn = get_session_connection("shop-read")
+        conn = get_session_connection(SHOP_READ_SESSION)
         if not conn:
             messagebox.showerror("Database Error", "Database connection is unavailable.")
             return
 
-        cursor = conn.cursor()
-        
-        # Base query
-        sql = "SELECT `item_id`, `name`, `price`, `quantity`, `category` FROM `stocks` WHERE `quantity` > 0"
-        params = []
-        
-        if category != "All Categories":
-            sql += " AND `category` = %s"
-            params.append(category)
-            
-        if search_term:
-            sql += " AND `name` LIKE %s"
-            params.append(f"%{search_term}%")
-            
-        sql += " ORDER BY `name` ASC"
-        
-        cursor.execute(sql, params)
-        results = cursor.fetchall()
+        results = buyer_data.fetch_available_products(conn, search_term, category)
         loaded_rows_count = len(results)
         
         for array in results:
@@ -641,7 +483,16 @@ def show_product_details(show_warning=True):
         return
 
     item_id = str(products_tree.item(selected_item)["values"][0])
-    product_details = fetch_product_details(item_id)
+    read_conn = get_session_connection(SHOP_READ_SESSION)
+    if not read_conn:
+        if show_warning:
+            messagebox.showerror("Product Details", "Database connection is unavailable.")
+        return
+
+    try:
+        product_details = buyer_data.fetch_product_details(read_conn, item_id)
+    except Exception:
+        product_details = None
     if not product_details:
         if show_warning:
             messagebox.showerror("Product Details", "Could not load product details.")
@@ -652,6 +503,7 @@ def show_product_details(show_warning=True):
     center_window(details_win, 920, 560)
     details_win.configure(fg_color=PALETTE_DARK)
     details_win.transient(shop)
+    details_win.bind("<Escape>", lambda event: details_win.destroy())
 
     container = ctk.CTkFrame(details_win, fg_color=PALETTE_DARK, corner_radius=12)
     container.pack(fill="both", expand=True, padx=16, pady=16)
@@ -677,7 +529,8 @@ def show_product_details(show_warning=True):
     )
     image_preview_label.pack(expand=True)
 
-    resolved_image_path = resolve_product_image_path(product_details.get("image_path"))
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    resolved_image_path = buyer_utils.resolve_product_image_path(product_details.get("image_path"), script_dir)
     if resolved_image_path and Image is not None:
         try:
             preview_image = Image.open(resolved_image_path)
@@ -825,17 +678,28 @@ def refresh_cart_display(save_cache=True):
     if save_cache:
         persist_cart_cache_for_current_user()
 
-def remove_from_cart():
+def remove_from_cart(require_confirmation=False):
     try:
         selected_item = cart_tree.selection()[0]
         # The iid of the treeview items is mapped to the index of cart_items array
         idx = int(selected_item)
         removed_name = cart_items[idx]['name']
+
+        if require_confirmation:
+            decision = messagebox.askyesno("Remove Item", f"Remove '{removed_name}' from your cart?")
+            if not decision:
+                return
+
         del cart_items[idx]
         refresh_cart_display()
         messagebox.showinfo("Cart Update", f"Removed {removed_name} from the cart.")
-    except IndexError:
+    except (IndexError, ValueError):
         messagebox.showwarning("Error", "Please select an item in your cart to remove.")
+
+
+def remove_from_cart_with_prompt(event=None):
+    remove_from_cart(require_confirmation=True)
+    return "break"
 
 def clear_cart():
     if not cart_items:
@@ -851,6 +715,7 @@ def show_digital_receipt(filename):
     receipt_win.title("Digital Receipt")
     receipt_win.geometry("400x500")
     receipt_win.configure(fg_color=PALETTE_DARK)
+    receipt_win.bind("<Escape>", lambda event: receipt_win.destroy())
     
     txt = ctk.CTkTextbox(receipt_win, font=("Courier", 10), fg_color=PALETTE_DARKEST, text_color=PALETTE_MINT)
     txt.pack(fill="both", expand=True, padx=20, pady=20)
@@ -896,8 +761,6 @@ def checkout():
             messagebox.showerror("Checkout Error", "Database connection is unavailable.")
             return
 
-        cursor = conn.cursor()
-        
         # 1. Create the Order
         subtotal = subtotal_var.get()
         vat = vat_var.get()
@@ -905,14 +768,35 @@ def checkout():
 
         order_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        cursor.execute(
-            """
-            INSERT INTO orders (
-                customer_name, customer_email, contact_number, customer_address,
-                total_amount, vat_amount, grand_total, payment_method, order_date, status
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """,
-            (
+        order_id = buyer_data.create_order(
+            conn,
+            customer_name,
+            customer_email,
+            contact_number,
+            customer_address,
+            subtotal,
+            vat,
+            grand_total,
+            payment_method,
+            order_date,
+            "Pending",
+        )
+        
+        # 2. Insert Order Items and Update Stock
+        for item in cart_items:
+            # Insert item history
+            buyer_data.insert_order_item(conn, order_id, item['item_id'], item['quantity'], item['price'])
+            
+            # Deduct stock (Update Query)
+            buyer_data.decrement_stock(conn, item['item_id'], item['quantity'])
+            
+        conn.commit()
+        
+        # 3. Generate receipt file.
+        receipt_filename = f"receipt_ORD{order_id}.txt"
+        try:
+            receipt_filename = buyer_utils.write_receipt_file(
+                order_id,
                 customer_name,
                 customer_email,
                 contact_number,
@@ -922,33 +806,13 @@ def checkout():
                 grand_total,
                 payment_method,
                 order_date,
-                "Pending",
-            ),
-        )
-        order_id = cursor.lastrowid # Get the generated Order ID
-        
-        # 2. Insert Order Items and Update Stock
-        for item in cart_items:
-            # Insert item history
-            cursor.execute(
-                "INSERT INTO order_items (order_id, item_id, quantity, price) VALUES (%s, %s, %s, %s)",
-                (order_id, item['item_id'], item['quantity'], item['price']),
+                cart_items,
             )
-            
-            # Deduct stock (Update Query)
-            cursor.execute(
-                "UPDATE stocks SET quantity = quantity - %s WHERE item_id = %s",
-                (item['quantity'], item['item_id']),
-            )
-            
-        conn.commit()
-        
-        # 3. Generate Receipt (Phase 4, Step 4)
-        generate_receipt(order_id, customer_name, customer_email, contact_number, customer_address, subtotal, vat, grand_total, payment_method, order_date)
+        except Exception as receipt_error:
+            print(f"Could not write receipt file: {receipt_error}")
         
         # 4. Display Receipt pop-up to user
-        filename = f"receipt_ORD{order_id}.txt"
-        show_digital_receipt(filename)
+        show_digital_receipt(receipt_filename)
         
         messagebox.showinfo("Success", "Checkout successful! Receipt generated. Thank you for your order.")
         
@@ -967,53 +831,20 @@ def checkout():
         if conn:
             conn.close()
 
-def generate_receipt(order_id, customer_name, email, contact, address, subtotal, vat, grand_total, payment, date_str):
-    filename = f"receipt_ORD{order_id}.txt"
-    try:
-        with open(filename, "w") as file:
-            file.write("=========================================\n")
-            file.write("            ITC TECH STORE               \n")
-            file.write("=========================================\n")
-            file.write(f"Order ID : #{order_id}\n")
-            file.write(f"Date     : {date_str}\n")
-            file.write(f"Customer : {customer_name}\n")
-            file.write(f"Email    : {email}\n")
-            file.write(f"Contact  : {contact}\n")
-            
-            # Format address string nicely if it's long
-            addr_line = address.replace('\n', ' ')
-            file.write(f"Address  : {addr_line}\n")
-            file.write(f"Payment  : {payment}\n")
-            file.write("-----------------------------------------\n")
-            file.write(f"{'Item':<20} | {'Qty':<5} | {'Price':<10}\n")
-            file.write("-----------------------------------------\n")
-            for item in cart_items:
-                name_short = (item['name'][:17] + '..') if len(item['name']) > 19 else item['name']
-                file.write(f"{name_short:<20} | {item['quantity']:<5} | P{item['price']:>10,.2f}\n")
-            file.write("-----------------------------------------\n")
-            file.write(f"Subtotal    : P {subtotal:>10,.2f}\n")
-            file.write(f"12% VAT     : P {vat:>10,.2f}\n")
-            file.write(f"GRAND TOTAL : P {grand_total:>10,.2f}\n")
-            file.write("=========================================\n")
-            file.write("        Thank you for shopping!          \n")
-    except Exception as e:
-        print("Could not write receipt file:", e)
-
 def my_orders():
     email = current_customer['email']
     if not email:
         messagebox.showerror("Error", "You must be logged in to view your orders.")
         return
         
+    conn = None
     try:
         conn = connectDB()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT order_id, order_date, grand_total, status FROM orders WHERE customer_email = %s ORDER BY order_id DESC",
-            (email,),
-        )
-        results = cur.fetchall()
-        conn.close()
+        if not conn:
+            messagebox.showerror("Database Error", "Database connection is unavailable.")
+            return
+
+        results = buyer_data.fetch_customer_orders(conn, email)
         
         if results:
             history_win = ctk.CTkToplevel(shop)
@@ -1045,6 +876,9 @@ def my_orders():
             messagebox.showinfo("No Orders Found", "You haven't placed any orders yet.")
     except Exception as e:
         messagebox.showerror("Database Error", f"Could not retrieve orders: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def logout():
     decision =messagebox.askyesno("Logout", "Are you sure you want to log out?")
@@ -1095,6 +929,16 @@ filter_frame.pack(fill="x", padx=10)
 ctk.CTkLabel(filter_frame, text="Search:", text_color=PALETTE_TEXT).pack(side="left", padx=(10, 5))
 search_entry = ctk.CTkEntry(filter_frame, width=150, height=40, font=ctk.CTkFont(family="Segoe UI", size=13), corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT)
 search_entry.pack(side="left", padx=5)
+
+
+def focus_search_entry(event=None):
+    search_entry.focus_set()
+    search_entry.select_range(0, tk.END)
+    return "break"
+
+
+shop.bind("<Control-f>", focus_search_entry)
+shop.bind("<Control-F>", focus_search_entry)
 
 ctk.CTkLabel(filter_frame, text="Category:", text_color=PALETTE_TEXT).pack(side="left", padx=(10, 5))
 shop_category_var = ctk.StringVar(value="All Categories")
@@ -1155,6 +999,7 @@ cart_tree.column("Price", width=70)
 cart_tree.column("Qty", width=50)
 cart_tree.column("Subtotal", width=80)
 cart_tree.pack(fill="both", expand=True, padx=10, pady=10)
+cart_tree.bind("<Delete>", remove_from_cart_with_prompt)
 
 # Cart Actions
 cart_action_frame = ctk.CTkFrame(right_frame, fg_color="transparent", corner_radius=15)
@@ -1203,7 +1048,8 @@ ctk.CTkButton(right_frame,  fg_color=PALETTE_MINT, hover_color=PALETTE_PRIMARY, 
 
 # Initialize and run
 def on_shop_app_close():
-    close_session_connection("shop-read")
+    close_session_connection(SHOP_READ_SESSION)
+    close_session_connection(SHOP_AUTH_SESSION)
     try:
         auth_win.destroy()
     except Exception:
