@@ -8,7 +8,7 @@ venv/
 .venv/
 env/
 ENV/
-.github
+/.github/
 
 # Editor/IDE settings
 .vscode/
