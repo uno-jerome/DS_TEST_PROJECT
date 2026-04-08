@@ -9,6 +9,7 @@ venv/
 env/
 ENV/
 .github/
+
 # Editor/IDE settings
 .vscode/
 .idea/
