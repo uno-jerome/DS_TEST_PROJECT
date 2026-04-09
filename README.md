@@ -73,20 +73,7 @@ python main.py --app both
 
 Change the default password after first login.
 
-## Runtime-generated files
-
-The app can generate local runtime files such as:
-
-- shop_state.json
-- receipt_*.txt
-- stocks_*.csv
-
-These are already ignored in [.gitignore](.gitignore).
-
 ## Notes
-
-- open_eye.png and closed_eye.png are used for password visibility toggles in the UI.
-- On startup, database checks run automatically to create missing tables/columns when possible.
 
 ## How to contribute
 
