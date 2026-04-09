@@ -1,5 +1,8 @@
 def _get_cursor(conn):
-    conn.ping(reconnect=True)
+    try:
+        conn.ping(True)
+    except TypeError:
+        conn.ping()
     return conn.cursor()
 
 
@@ -149,9 +152,20 @@ def fetch_order_header(conn, order_id):
     cur = _get_cursor(conn)
     cur.execute(
         """
-        SELECT customer_name, contact_number, customer_address,
-               vat_amount, grand_total, payment_method, order_date, status
-        FROM orders WHERE order_id=%s
+        SELECT
+            o.customer_name,
+            o.contact_number,
+            o.customer_address,
+            o.customer_email,
+            COALESCE(o.customer_username, c.username) AS customer_username,
+            o.vat_amount,
+            o.grand_total,
+            o.payment_method,
+            o.order_date,
+            o.status
+        FROM orders o
+        LEFT JOIN customers c ON c.email = o.customer_email
+        WHERE o.order_id=%s
         """,
         (order_id,),
     )

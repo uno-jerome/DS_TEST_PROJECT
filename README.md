@@ -1,59 +1,95 @@
 # Final Project ITC - Desktop E-Commerce
 
-A simple desktop e-commerce system built with Python, CustomTkinter, and MySQL.
+A desktop e-commerce system built with Python, CustomTkinter, and MySQL.
 
-## What this project does
+## What it does
 
-- Admin app: manage inventory, update order status, manage admin accounts
-- Shop app: customer login/register, browse products, cart, checkout, order history
-- Database bootstrap: creates required tables on startup
+- Buyer app: register/login (username, email, or phone), browse products, manage cart, checkout, and view order history.
+- Admin app: manage inventory, view and update orders, and create sub-admin users.
+- Launcher: start buyer, admin, or both apps from one command.
 
 ## Requirements
 
 - Python 3.10+
 - MySQL Server
-- pip (Python package installer)
+- Python packages from requirements.txt
 
-## Setup
-
-1. Clone or download this project.
-2. Create and activate a virtual environment.
-3. Install dependencies:
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-4. Create the database in MySQL (one time):
+## Database setup
 
-```sql
-CREATE DATABASE itc_database_admin;
+The app uses the schema from [Database.sql](Database.sql) and runtime migration checks in [database.py](database.py).
+
+Default database name:
+
+- itc_database_admin
+
+You can override database connection values with environment variables:
+
+- DB_HOST
+- DB_PORT
+- DB_USER
+- DB_PASSWORD
+- DB_NAME
+
+Example .env values:
+
+```env
+DB_HOST=localhost
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=root
+DB_NAME=itc_database_admin
 ```
 
-5. Open `database.py` and update `DB_CONFIG` with your MySQL username/password if needed.
+## How to run
 
-## Run
-
-- Start admin app:
+Buyer app (default):
 
 ```bash
-python admin_app.py
+python main.py
 ```
 
-- Start shop app:
+Admin app:
 
 ```bash
-python buyer_app.py
+python main.py --app admin
+```
+
+Run both apps:
+
+```bash
+python main.py --app both
 ```
 
 ## Default admin login
 
-- Username: `admin`
-- Password: `admin123`
+- Username: admin
+- Password: admin123
 
-Change this immediately after first login.
+Change the default password after first login.
+
+## Runtime-generated files
+
+The app can generate local runtime files such as:
+
+- shop_state.json
+- receipt_*.txt
+- stocks_*.csv
+
+These are already ignored in [.gitignore](.gitignore).
 
 ## Notes
 
-- This repo uses `.gitignore` so local/runtime files (venv, receipts, cache, exports, local state, secrets) are not committed.
-- If you already staged files before adding `.gitignore`, unstage/remove them from Git index first.
+- open_eye.png and closed_eye.png are used for password visibility toggles in the UI.
+- On startup, database checks run automatically to create missing tables/columns when possible.
+
+## How to contribute
+
+1. Create a feature branch.
+2. Keep commits small and clear (for example: feat: add cart validation).
+3. Test the buyer and admin flows before opening a pull request.

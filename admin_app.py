@@ -1,4 +1,5 @@
-import os
+﻿import os
+import logging
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import customtkinter as ctk
@@ -16,10 +17,24 @@ from security_utils import (
     verify_password,
 )
 
+PILImage = None
+try:
+    from PIL import Image as _PILImage
+    PILImage = _PILImage
+except Exception:
+    PILImage = None
+
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
+
 APP_START_TS = time.perf_counter()
 db_setup_start = time.perf_counter()
 setup_database()
-print(f"[startup] Admin DB setup check: {time.perf_counter() - db_setup_start:.3f}s")
+logger.info(
+    "Admin DB setup check complete",
+    extra={"duration_seconds": round(time.perf_counter() - db_setup_start, 3)},
+)
 
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("green")
@@ -31,6 +46,51 @@ PALETTE_MINT = "#B0E4CC"
 PALETTE_TEXT = "#E8FFF5"
 MAX_ADMIN_LOGIN_ATTEMPTS = 5
 ADMIN_LOCK_MINUTES = 15
+EYE_ICON_FALLBACK = "👁"
+ORDER_STATUS_DISPLAY_MAP = {
+    "PENDING": "Pending",
+    "PROCESSING": "Processing",
+    "SHIPPED": "Shipped",
+    "COMPLETED": "Completed",
+    "CANCELLED": "Cancelled",
+}
+
+
+def load_eye_toggle_icons():
+    if PILImage is None:
+        return None, None
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    open_icon_path = os.path.join(script_dir, "open_eye.png")
+    closed_icon_path = os.path.join(script_dir, "closed_eye.png")
+
+    try:
+        open_icon_img = PILImage.open(open_icon_path)
+        closed_icon_img = PILImage.open(closed_icon_path)
+    except Exception:
+        return None, None
+
+    open_icon = ctk.CTkImage(light_image=open_icon_img, dark_image=open_icon_img, size=(12, 12))
+    closed_icon = ctk.CTkImage(light_image=closed_icon_img, dark_image=closed_icon_img, size=(12, 12))
+    return open_icon, closed_icon
+
+
+OPEN_EYE_ICON, CLOSED_EYE_ICON = load_eye_toggle_icons()
+
+
+def normalize_order_status(status_value):
+    raw_status = str(status_value or "").strip()
+    if not raw_status:
+        return "Pending"
+
+    upper_status = raw_status.upper()
+    if upper_status in ORDER_STATUS_DISPLAY_MAP:
+        return ORDER_STATUS_DISPLAY_MAP[upper_status]
+
+    if raw_status in ORDER_STATUS_DISPLAY_MAP.values():
+        return raw_status
+
+    return raw_status.title() if raw_status.isupper() else raw_status
 
 window = ctk.CTk()
 window.title("Inventory System")
@@ -64,14 +124,97 @@ def maximize_window(win):
     except Exception:
         pass
 
+
+def show_toplevel_in_front(child_window, parent_window=None, modal=False):
+    try:
+        if parent_window is not None:
+            child_window.transient(parent_window)
+    except tk.TclError:
+        pass
+
+    try:
+        child_window.update_idletasks()
+    except tk.TclError:
+        pass
+
+    try:
+        child_window.lift()
+        child_window.focus_force()
+    except tk.TclError:
+        pass
+
+    try:
+        child_window.attributes("-topmost", True)
+    except tk.TclError:
+        pass
+
+    if modal:
+        try:
+            child_window.after(20, child_window.grab_set)
+        except tk.TclError:
+            pass
+
+
+def close_toplevel_window(child_window):
+    try:
+        if child_window.grab_current() == child_window:
+            child_window.grab_release()
+    except tk.TclError:
+        pass
+
+    try:
+        child_window.attributes("-topmost", False)
+    except tk.TclError:
+        pass
+
+    try:
+        child_window.destroy()
+    except tk.TclError:
+        pass
+
+
+def attach_password_toggle(entry_widget, parent_widget):
+    button_surface_color = entry_widget.cget("fg_color")
+
+    def set_toggle_icon(is_visible):
+        if OPEN_EYE_ICON and CLOSED_EYE_ICON:
+            toggle_button.configure(image=OPEN_EYE_ICON if is_visible else CLOSED_EYE_ICON, text="")
+        else:
+            toggle_button.configure(image=None, text=EYE_ICON_FALLBACK)
+
+    def toggle_password_visibility():
+        if entry_widget.cget("show") == "":
+            entry_widget.configure(show="*")
+            set_toggle_icon(False)
+        else:
+            entry_widget.configure(show="")
+            set_toggle_icon(True)
+
+    toggle_button = ctk.CTkButton(
+        parent_widget,
+        text="",
+        image=CLOSED_EYE_ICON,
+        width=18,
+        height=18,
+        corner_radius=0,
+        border_width=0,
+        fg_color=button_surface_color,
+        hover_color=button_surface_color,
+        text_color=PALETTE_TEXT,
+        font=ctk.CTkFont(size=9),
+        command=toggle_password_visibility,
+    )
+    toggle_button.place(relx=1.0, rely=0.5, x=-12, anchor="e")
+    set_toggle_icon(False)
+
+    return toggle_button
+
 center_window(window, 1180, 820)
 window.minsize(1080, 720)
 maximize_window(window)
 
-# Hide main window initially for the gatekeeper
 window.withdraw()
 
-# --- Admin Login Gatekeeper ---
 login_window = ctk.CTkToplevel(window)
 login_window.title("Admin Log In")
 center_window(login_window, 450, 450)
@@ -134,13 +277,13 @@ def check_login(event=None):
     conn.commit()
 
     messagebox.showinfo("Success", "Welcome, Admin!")
-    login_window.destroy()  # Close the login screen
-    refreshTable()          # Ensure latest data on login
+    login_window.destroy()
+    refreshTable()
     try:
-        refresh_orders()    # Refresh orders list too
+        refresh_orders()
     except NameError:
-        pass                # Ignore if refresh_orders isn't defined yet
-    window.deiconify()      # Show the Main Inventory System
+        pass
+    window.deiconify()
     maximize_window(window)
 
 login_frame = ctk.CTkFrame(login_window, fg_color=PALETTE_DARK, corner_radius=0)
@@ -166,9 +309,13 @@ username_entry = ctk.CTkEntry(
 )
 username_entry.pack(pady=(0, 16))
 
+login_password_row = ctk.CTkFrame(login_card, fg_color="transparent", width=320, height=48)
+login_password_row.pack(pady=(0, 28))
+login_password_row.pack_propagate(False)
+
 password_entry = ctk.CTkEntry(
-    login_card,
-    show="•",
+    login_password_row,
+    show="*",
     width=320,
     height=48,
     placeholder_text="Password",
@@ -179,7 +326,8 @@ password_entry = ctk.CTkEntry(
     text_color=PALETTE_MINT,
     placeholder_text_color="#7FB8A3"
 )
-password_entry.pack(pady=(0, 28))
+password_entry.pack(fill="both", expand=True)
+attach_password_toggle(password_entry, login_password_row)
 
 ctk.CTkButton(
     login_card,
@@ -195,9 +343,7 @@ ctk.CTkButton(
 ).pack(pady=(0, 20))
 
 login_window.bind('<Return>', check_login)
-# ------------------------------
 
-# Create Tabview instead of Notebook
 notebook = ctk.CTkTabview(
     window,
     width=1160,
@@ -226,7 +372,6 @@ admin_tab.configure(fg_color=PALETTE_DARKEST)
 
 style = ttk.Style()
 style.theme_use('default')
-style.theme_use('default')
 style.configure("Treeview.Heading", font=("Segoe UI", 12, "bold"), background=PALETTE_DARK, foreground=PALETTE_MINT)
 style.configure("Treeview", font=("Segoe UI", 12), rowheight=46, background="#0F231D", foreground=PALETTE_MINT, fieldbackground="#0F231D")
 style.map("Treeview", background=[('selected', PALETTE_PRIMARY)], foreground=[('selected', PALETTE_TEXT)])
@@ -238,20 +383,18 @@ alpha='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
 for i in range(0,5):
     placeholderArray[i] = tk.StringVar() 
     
-# hide
-# functions = def  functions():
 
 conn = get_session_connection("admin-ui") or connectDB()
 if not conn:
     messagebox.showerror("Database Error", "Could not connect to the database.")
     raise SystemExit(1)
 
-# reading the data from sqlyog
 def read():
     return admin_data.fetch_all_stocks(conn)
 def refreshTable():
-        for data in my_Tree.get_children():
-            my_Tree.delete(data)
+        existing_rows = my_Tree.get_children()
+        if existing_rows:
+            my_Tree.delete(*existing_rows)
         for array in read():
             qty = int(array[3])
             formatted_price = format_price_display(array[2])
@@ -269,17 +412,12 @@ def refreshTable():
         my_Tree.tag_configure('out_of_stock', background="#4D2D2D", foreground=PALETTE_TEXT)
     
     
-# generate unique id 
 def generateID():
-    itemId=''
-    for i in range(0,3):
-        randno=random.randrange(0,(len(numeric)-1))
-        itemId=itemId+str(numeric[randno])
-    rando=random.randrange(0, (len(alpha)-1))
-    itemId= itemId + '-' + str(alpha[randno])
-    print("Generated: " + itemId)
+    random_digits = "".join(random.choice(numeric) for _ in range(3))
+    random_letter = random.choice(alpha)
+    itemId = f"{random_digits}-{random_letter}"
+    logger.debug("Generated item id", extra={"item_id": itemId})
     setph(itemId,0) 
-# uhm
 def setph(word, num):
     for ph in range(0,5):
         if ph == num:
@@ -293,7 +431,6 @@ def format_price_field(event=None):
         numeric_price = parse_price_input(raw_price)
         placeholderArray[2].set(format_price_display(numeric_price))
     except ValueError:
-        # Keep user input untouched if still invalid.
         pass
 
 
@@ -318,7 +455,7 @@ def load_product_details(item_id):
         descriptionTextbox.insert("1.0", row[0] or "")
         imagePathVar.set(row[1] or "")
     except Exception as detail_error:
-        print("Could not load product details:", detail_error)
+        logger.error("Could not load product details", extra={"error": str(detail_error), "item_id": item_id})
 
 
 def save_product_details(item_id):
@@ -341,20 +478,17 @@ def browse_product_image():
     if chosen_file:
         imagePathVar.set(chosen_file)
 
-# the inputed data would be place in sqlyog/database
 def add():
-    itemId = str(itemIdEntry.get())  # get the item id from the entry
-    name = str(nameEntry.get())  # get the name from the entry
-    price = str(priceEntry.get())  # get the price from the entry
-    quanti = str(quantiEntry.get())  # get the quantity from the entry
-    cat = str(categoryCombo.get())  # get the category from the entry
+    itemId = str(itemIdEntry.get())
+    name = str(nameEntry.get())
+    price = str(priceEntry.get())
+    quanti = str(quantiEntry.get())
+    cat = str(categoryCombo.get())
 
-    # Check if all fields are filled
     if not(itemId and itemId.strip()) or not(name and name.strip()) or not(price and price.strip()) or not(quanti and quanti.strip()) or not(cat and cat.strip()):
         messagebox.showwarning("", "Please fill up all entries")
         return
 
-    # Check if itemId format is valid
     if len(itemId) < 5 or not(itemId[3] == '-') or not(itemId[:3].isdigit()) or not(itemId[4].isalpha()):
         messagebox.showwarning("", "Invalid Item Id")
         return
@@ -389,7 +523,7 @@ def add():
             setph('', (num))
         clear_product_details_fields()
     except Exception as e:
-        print(e)
+        logger.error("Stock save failed", extra={"error": str(e)})
         messagebox.showwarning("", "Error while saving ref: " + str(e))
         return
 
@@ -400,9 +534,10 @@ def update():
     try:
         selectedItem = my_Tree.selection()[0]
         selectedItemId = str(my_Tree.item(selectedItem)['values'][0])
-    except:
+    except (IndexError, KeyError, TypeError):
         messagebox.showwarning("", "Please select a data row")
-    print(selectedItemId)
+        return
+
     itemId = str(itemIdEntry.get())
     name = str(nameEntry.get())
     price = str(priceEntry.get())
@@ -443,7 +578,6 @@ def update():
         return
     refreshTable()
      
-# delete 
 def delete():
     try:
         if(my_Tree.selection()[0]):
@@ -452,11 +586,9 @@ def delete():
                 return
             else:
                 selectedItem = my_Tree.selection()[0]
-                # Because iid is the full tuple string representation in this old setup, we get value from Treeview:
                 itemId = str(my_Tree.item(selectedItem)['values'][0])
                 
                 try:
-                    # SAFETY CHECK: Don't delete if it is part of a pending/processing order
                     active_orders_count = admin_data.count_active_orders_for_item(conn, itemId)
                     
                     if active_orders_count > 0:
@@ -470,10 +602,9 @@ def delete():
                 except Exception as e:
                     messagebox.showinfo("","Sorry, an error occured: " + str(e))
                 refreshTable()
-    except:
+    except (IndexError, KeyError, TypeError):
         messagebox.showwarning("", "Please select a data row")
 
-# select function
 def select():
     try:
         selectedItem = my_Tree.selection()[0]
@@ -488,15 +619,14 @@ def select():
         setph(quanti,3)
         setph(cat,4)
         load_product_details(itemId)
-    except:
+    except (IndexError, KeyError, TypeError):
         messagebox.showwarning("", "Please select a data row")
 
-# find function
 def find():
     itemId = str(itemIdEntry.get())
     name = str(nameEntry.get())
     price = str(priceEntry.get())
-    normalized_price = price.replace(",", "").replace("₱", "").strip()
+    normalized_price = price.replace(",", "").replace("PHP", "").strip()
     quanti = str(quantiEntry.get())
     cat = str(categoryCombo.get())
     if not any([itemId.strip(), name.strip(), normalized_price, quanti.strip(), cat.strip()]):
@@ -508,27 +638,24 @@ def find():
         for num in range(0,5):
             setph(result[0][num],(num))
         load_product_details(str(result[0][0]))
-    except:
+    except (IndexError, TypeError):
         messagebox.showwarning("","No data found")
 
 def clear():
     for num in range(0,5):
         setph('',(num))
     clear_product_details_fields()
-# export as excel function
 def exportExcel():
     dataraw = admin_data.fetch_stocks_for_export(conn)
-    date = str(datetime.now())
-    date = date.replace(' ', '_')
-    date = date.replace(':', '-')
-    dateFinal = date[0:16]
-    with open("stocks_"+dateFinal+".csv",'a',newline='') as f:
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"stocks_{timestamp}.csv"
+    with open(filename,'w',newline='') as f:
         w = csv.writer(f, dialect='excel')
+        w.writerow(["item_id", "name", "price", "quantity", "category", "date"])
         for record in dataraw:
             w.writerow(record)
-    print("saved: stocks_"+dateFinal+".csv")
-    # Keep shared admin connection open for the whole UI session.
-    messagebox.showinfo("","Excel file downloaded")
+    logger.info("Stock export created", extra={"filename": filename})
+    messagebox.showinfo("", f"CSV file downloaded: {filename}")
 
 frame = ctk.CTkFrame(inventory_tab, fg_color=PALETTE_DARK, corner_radius=16)
 frame.pack(pady=(8, 10), padx=16, fill="x")
@@ -597,7 +724,6 @@ categoryCombo.grid(row=2, column=1, padx=(0, 16), pady=8, sticky="ew")
 
 priceEntry.bind("<FocusOut>", format_price_field)
 
-# Item ID is generated by the system, so keep it read-only in the UI.
 itemIdEntry.configure(state="disabled")
 
 generateidBtn = ctk.CTkButton(entriesFrame, text="Generate ID", width=180, height=40, fg_color=btnColor, text_color=PALETTE_TEXT, command=generateID, font=ctk.CTkFont(family="Segoe UI", size=13, weight="bold"), corner_radius=10)
@@ -651,7 +777,6 @@ inventoryTreeScrollbar.pack(side="right", fill="y", padx=(6, 0))
 
 refreshTable()
 
-# --- Orders Management Tab Structure ---
 orders_top_frame = ctk.CTkFrame(orders_tab, fg_color="transparent", corner_radius=0)
 orders_top_frame.pack(fill="x", pady=(12, 4), padx=22)
 
@@ -681,8 +806,8 @@ def refresh_orders():
 def logout():
     decision =messagebox.askquestion("Logout", "Are you sure you want to logout?")
     if decision == 'yes':
-        window.withdraw() # Hide main app
-        login_window.deiconify() # Reshow login screen
+        window.withdraw()
+        login_window.deiconify()
         username_entry.delete(0, 'end')
         password_entry.delete(0, 'end')
         username_entry.focus()
@@ -690,23 +815,26 @@ def logout():
 def filter_orders():
     term = order_search_entry.get().strip()
     status = order_status_combo.get()
-    
-    for data in orders_tree.get_children():
-        orders_tree.delete(data)
+
+    existing_rows = orders_tree.get_children()
+    if existing_rows:
+        orders_tree.delete(*existing_rows)
         
     try:
         results = admin_data.fetch_filtered_orders(conn, term, status)
         for array in results:
-            display_values = (array[0], array[1], format_price_display(array[2]), array[3], array[4])
+            customer_name = array[1] or "N/A"
+            status_label = normalize_order_status(array[4])
+            display_values = (array[0], customer_name, format_price_display(array[2]), array[3], status_label)
             orders_tree.insert(parent='', index='end', iid=array[0], values=display_values, tag="orow")
     except Exception as e:
-        print("Could not load filtered orders:", e)
+        logger.error("Could not load filtered orders", extra={"error": str(e), "term": term, "status": status})
 
 def update_order_status():
     try:
         selected_item = orders_tree.selection()[0]
         order_id = str(orders_tree.item(selected_item)['values'][0])
-        current_status = str(orders_tree.item(selected_item)['values'][4])
+        current_status = normalize_order_status(orders_tree.item(selected_item)['values'][4])
 
         if current_status in ['Completed', 'Cancelled']:
             messagebox.showwarning("Error", f"Order is already {current_status} and cannot be changed.")
@@ -716,16 +844,24 @@ def update_order_status():
         status_win.title("Update Status")
         center_window(status_win, 340, 220)
         status_win.configure(fg_color=PALETTE_DARK)
+        show_toplevel_in_front(status_win, window, modal=True)
+        status_win.protocol("WM_DELETE_WINDOW", lambda: close_toplevel_window(status_win))
+        status_win.bind("<Escape>", lambda event: close_toplevel_window(status_win))
 
         ctk.CTkLabel(status_win, text=f"Update Order #{order_id}", text_color=PALETTE_MINT, font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(16, 8))
         ctk.CTkLabel(status_win, text="Select Status", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=13)).pack(pady=(0, 6))
 
-        status_var = tk.StringVar(value=(current_status if current_status != 'Pending' else 'Processing'))
+        status_options = ["Processing", "Shipped", "Completed", "Cancelled"]
+        default_status = current_status if current_status != 'Pending' else 'Processing'
+        if default_status not in status_options:
+            default_status = "Processing"
+
+        status_var = tk.StringVar(value=default_status)
         status_combo = ttk.Combobox(status_win, textvariable=status_var, values=["Processing", "Shipped", "Completed", "Cancelled"], state="readonly", width=22)
         status_combo.pack(pady=8)
 
         def save_status():
-            new_status = status_var.get().strip()
+            new_status = normalize_order_status(status_var.get())
             if not new_status:
                 messagebox.showwarning("Error", "Select a status.", parent=status_win)
                 return
@@ -743,7 +879,7 @@ def update_order_status():
                     refreshTable()
 
                 messagebox.showinfo("Success", f"Order #{order_id} marked as {new_status}.", parent=status_win)
-                status_win.destroy()
+                close_toplevel_window(status_win)
             except Exception as err:
                 messagebox.showerror("Error", f"Could not update status: {err}", parent=status_win)
 
@@ -756,38 +892,100 @@ def view_order_details():
     try:
         selected_item = orders_tree.selection()[0]
         order_id = str(orders_tree.item(selected_item)['values'][0])
-        customer_name = str(orders_tree.item(selected_item)['values'][1])
 
-        # Fetch extra order details
         order_info = admin_data.fetch_order_header(conn, order_id)
         if not order_info:
             messagebox.showerror("Error", "Could not fetch order details.")
             return
             
-        c_name, c_contact, c_address, vat, grand_total, pay_method, o_date, status = order_info
-        
-        # Create a popup to show the items for this order
+        c_name, c_contact, c_address, c_email, c_username, vat, grand_total, pay_method, o_date, status = order_info
+        status = normalize_order_status(status)
+
         details_window = ctk.CTkToplevel(window)
         details_window.title(f"Order Details - #{order_id}")
-        details_window.geometry("600x500")
+        details_window.geometry("680x540")
         details_window.configure(fg_color="#f4f4f4")
-        
-        # Top Frame: Customer & Shipping Info
-        info_frame = ctk.CTkFrame(details_window,  fg_color="#f4f4f4", corner_radius=15)
-        info_frame.pack(fill="x", padx=10, pady=10)
-        
-        ctk.CTkLabel(info_frame, text=f"Name: {c_name}", fg_color="#f4f4f4").grid(row=0, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkLabel(info_frame, text=f"Contact: {c_contact or 'N/A'}", fg_color="#f4f4f4").grid(row=1, column=0, sticky="w", padx=10, pady=2)
-        ctk.CTkLabel(info_frame, text=f"Payment: {pay_method or 'N/A'}", fg_color="#f4f4f4").grid(row=0, column=1, sticky="w", padx=10, pady=2)
-        ctk.CTkLabel(info_frame, text=f"Date: {o_date}", fg_color="#f4f4f4").grid(row=1, column=1, sticky="w", padx=10, pady=2)
-        ctk.CTkLabel(info_frame, text=f"Address: {c_address or 'N/A'}", fg_color="#f4f4f4", wraplength=400, justify="left").grid(row=2, column=0, columnspan=2, sticky="w", padx=10)
+        show_toplevel_in_front(details_window, window, modal=True)
+        details_window.protocol("WM_DELETE_WINDOW", lambda: close_toplevel_window(details_window))
+        details_window.bind("<Escape>", lambda event: close_toplevel_window(details_window))
 
-        # Middle Frame: Items Ordered
-        items_frame = ctk.CTkFrame(details_window,  fg_color="#f4f4f4", corner_radius=15)
+        card_bg = "#ffffff"
+        details_text = "#111111"
+        muted_text = "#2e2e2e"
+
+        info_frame = ctk.CTkFrame(details_window, fg_color=card_bg, corner_radius=15)
+        info_frame.pack(fill="x", padx=10, pady=10)
+
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Name: {c_name or 'N/A'}",
+            fg_color="transparent",
+            text_color=details_text,
+        ).grid(row=0, column=0, sticky="w", padx=10, pady=2)
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Contact: {c_contact or 'N/A'}",
+            fg_color="transparent",
+            text_color=details_text,
+        ).grid(row=1, column=0, sticky="w", padx=10, pady=2)
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Payment: {pay_method or 'N/A'}",
+            fg_color="transparent",
+            text_color=details_text,
+        ).grid(row=0, column=1, sticky="w", padx=10, pady=2)
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Date: {o_date}",
+            fg_color="transparent",
+            text_color=details_text,
+        ).grid(row=1, column=1, sticky="w", padx=10, pady=2)
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Email: {c_email or 'N/A'}",
+            fg_color="transparent",
+            text_color=details_text,
+        ).grid(row=2, column=0, sticky="w", padx=10, pady=2)
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Username: {c_username or 'N/A'}",
+            fg_color="transparent",
+            text_color=details_text,
+        ).grid(row=2, column=1, sticky="w", padx=10, pady=2)
+        ctk.CTkLabel(
+            info_frame,
+            text=f"Address: {c_address or 'N/A'}",
+            fg_color="transparent",
+            text_color=muted_text,
+            wraplength=520,
+            justify="left",
+        ).grid(row=3, column=0, columnspan=2, sticky="w", padx=10)
+
+        items_frame = ctk.CTkFrame(details_window, fg_color=card_bg, corner_radius=15)
         items_frame.pack(fill="both", expand=True, padx=10)
+
+        details_tree_style = ttk.Style(details_window)
+        details_tree_style.configure(
+            "OrderDetails.Treeview",
+            font=("Segoe UI", 11),
+            rowheight=30,
+            background="#ffffff",
+            foreground="#111111",
+            fieldbackground="#ffffff",
+        )
+        details_tree_style.configure(
+            "OrderDetails.Treeview.Heading",
+            font=("Segoe UI", 11, "bold"),
+            background="#e6e6e6",
+            foreground="#111111",
+        )
+        details_tree_style.map(
+            "OrderDetails.Treeview",
+            background=[("selected", "#dce9ff")],
+            foreground=[("selected", "#111111")],
+        )
         
-        # Create Treeview for items
-        items_tree = ttk.Treeview(items_frame, show='headings', height=8)
+        items_tree = ttk.Treeview(items_frame, style="OrderDetails.Treeview", show='headings', height=8)
         items_tree['columns'] = ("Item ID", "Name", "Quantity", "Price", "Subtotal")
         items_tree.column("Item ID", anchor='w', width=80)
         items_tree.column("Name", anchor='w', width=180)
@@ -795,15 +993,35 @@ def view_order_details():
         items_tree.column("Price", anchor='w', width=80)
         items_tree.column("Subtotal", anchor='w', width=100)
 
-        items_tree.heading("Item ID",  anchor='w')
-        items_tree.heading("Name",  anchor='w')
-        items_tree.heading("Quantity",  anchor='w')
-        items_tree.heading("Price",  anchor='w')
-        items_tree.heading("Subtotal",  anchor='w')
+        items_tree.heading("Item ID", text="Item ID", anchor='w')
+        items_tree.heading("Name", text="Name", anchor='w')
+        items_tree.heading("Quantity", text="Quantity", anchor='w')
+        items_tree.heading("Price", text="Price", anchor='w')
+        items_tree.heading("Subtotal", text="Subtotal", anchor='w')
 
         items_tree.pack(fill="both", expand=True, padx=10, pady=10)
 
-        # Fetch the items from the database
+        def view_txt_receipt():
+            filename = f"receipt_ORD{order_id}.txt"
+            if not os.path.exists(filename):
+                messagebox.showwarning("Not Found", f"Receipt {filename} is missing.")
+                return
+
+            receipt_win = ctk.CTkToplevel(details_window)
+            receipt_win.title(f"Receipt Printout - #{order_id}")
+            receipt_win.geometry("400x500")
+            receipt_win.configure(fg_color="#f4f4f4")
+            show_toplevel_in_front(receipt_win, details_window, modal=True)
+            receipt_win.protocol("WM_DELETE_WINDOW", lambda: close_toplevel_window(receipt_win))
+            receipt_win.bind("<Escape>", lambda event: close_toplevel_window(receipt_win))
+
+            txt = ctk.CTkTextbox(receipt_win, width=360, height=420, fg_color=card_bg, text_color=details_text)
+            txt.pack(fill="both", expand=True, padx=20, pady=20)
+
+            with open(filename, "r") as file:
+                txt.insert("1.0", file.read())
+                txt.configure(state="disabled")
+
         results = admin_data.fetch_order_detail_items(conn, order_id)
         for row in results:
             formatted_row = (
@@ -815,42 +1033,53 @@ def view_order_details():
             )
             items_tree.insert("", "end", values=formatted_row)
         
-        # Bottom Frame: Payment Summary
-        summary_frame = ctk.CTkFrame(details_window, fg_color="#e8e8e8", relief="groove", corner_radius=15)
+        summary_frame = ctk.CTkFrame(details_window, fg_color=card_bg, corner_radius=15)
         summary_frame.pack(fill="x", side="bottom", padx=10, pady=10)
-        
-        ctk.CTkLabel(summary_frame, text=f"Status: {status}", font=("Arial", 10, "bold"), fg_color="#e8e8e8").pack(side="left", padx=10, pady=10)
-        
-        totals_container = ctk.CTkFrame(summary_frame, fg_color="#e8e8e8", corner_radius=15)
-        totals_container.pack(side="right", padx=10)
-        
-        ctk.CTkLabel(totals_container, text=f"VAT (12%): ₱ {float(vat or 0):,.2f}", fg_color="#e8e8e8").grid(row=0, column=0, sticky="e", pady=2)
-        ctk.CTkLabel(totals_container, text=f"GRAND TOTAL: ₱ {float(grand_total or 0):,.2f}", font=("Arial", 12, "bold"), text_color="red", fg_color="#e8e8e8").grid(row=1, column=0, sticky="e", pady=2)
 
-        # Print/View Receipt Button
-        def view_txt_receipt():
-            filename = f"receipt_ORD{order_id}.txt"
-            if not os.path.exists(filename):
-                messagebox.showwarning("Not Found", f"Receipt {filename} is missing.")
-                return
-            
-            receipt_win = ctk.CTkToplevel(details_window)
-            receipt_win.title(f"Receipt Printout - #{order_id}")
-            receipt_win.geometry("400x500")
+        summary_frame.grid_columnconfigure(0, weight=1)
+        summary_frame.grid_columnconfigure(1, weight=1)
+        summary_frame.grid_columnconfigure(2, weight=0)
 
-            txt = ctk.CTkTextbox(receipt_win, width=360, height=420)
-            txt.pack(fill="both", expand=True, padx=20, pady=20)
-            
-            with open(filename, "r") as file:
-                txt.insert("1.0", file.read())
-                txt.configure(state="disabled")
+        ctk.CTkLabel(
+            summary_frame,
+            text=f"Status: {status}",
+            font=("Arial", 10, "bold"),
+            fg_color="transparent",
+            text_color=details_text,
+        ).grid(row=0, column=0, sticky="w", padx=(12, 6), pady=10)
 
-        ctk.CTkButton(summary_frame, text="View Receipt", fg_color="#53d769", text_color='white', command=view_txt_receipt, font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"), corner_radius=10).pack(side="right", padx=20, pady=10)
+        totals_container = ctk.CTkFrame(summary_frame, fg_color="transparent", corner_radius=0)
+        totals_container.grid(row=0, column=1, sticky="e", padx=8, pady=10)
+
+        ctk.CTkLabel(
+            totals_container,
+            text=f"VAT (12%): PHP {float(vat or 0):,.2f}",
+            fg_color="transparent",
+            text_color=muted_text,
+        ).grid(row=0, column=0, sticky="e", pady=2)
+        ctk.CTkLabel(
+            totals_container,
+            text=f"GRAND TOTAL: PHP {float(grand_total or 0):,.2f}",
+            font=("Arial", 12, "bold"),
+            text_color="#b3261e",
+            fg_color="transparent",
+        ).grid(row=1, column=0, sticky="e", pady=2)
+
+        ctk.CTkButton(
+            summary_frame,
+            text="View Receipt",
+            width=130,
+            height=38,
+            fg_color="#53d769",
+            text_color='white',
+            command=view_txt_receipt,
+            font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"),
+            corner_radius=10,
+        ).grid(row=0, column=2, sticky="e", padx=(8, 12), pady=10)
 
     except Exception as e:
         messagebox.showwarning("Error", f"Could not view details: {e}")
 
-# Order Filter Row
 order_filter_frame = ctk.CTkFrame(orders_top_frame, fg_color=PALETTE_DARK, corner_radius=12)
 order_filter_frame.pack(fill="x")
 
@@ -947,16 +1176,21 @@ admin_user_entry = ctk.CTkEntry(update_frame, width=260, corner_radius=8, height
 admin_user_entry.grid(row=2, column=1, padx=(8, 10), pady=8, sticky="ew")
 
 ctk.CTkLabel(update_frame, text="Old Password:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14, weight="bold")).grid(row=3, column=0, padx=(10, 8), pady=8, sticky="e")
-admin_old_pw_entry = ctk.CTkEntry(update_frame, width=260, show="*", corner_radius=8, height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13))
-admin_old_pw_entry.grid(row=3, column=1, padx=(8, 10), pady=8, sticky="ew")
+admin_old_pw_row = ctk.CTkFrame(update_frame, fg_color="transparent")
+admin_old_pw_row.grid(row=3, column=1, padx=(8, 10), pady=8, sticky="ew")
+admin_old_pw_entry = ctk.CTkEntry(admin_old_pw_row, width=260, show="*", corner_radius=8, height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13))
+admin_old_pw_entry.pack(fill="x", expand=True)
+attach_password_toggle(admin_old_pw_entry, admin_old_pw_row)
 
 ctk.CTkLabel(update_frame, text="New Password:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14, weight="bold")).grid(row=4, column=0, padx=(10, 8), pady=8, sticky="e")
-admin_new_pw_entry = ctk.CTkEntry(update_frame, width=260, show="*", corner_radius=8, height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13))
-admin_new_pw_entry.grid(row=4, column=1, padx=(8, 10), pady=8, sticky="ew")
+admin_new_pw_row = ctk.CTkFrame(update_frame, fg_color="transparent")
+admin_new_pw_row.grid(row=4, column=1, padx=(8, 10), pady=8, sticky="ew")
+admin_new_pw_entry = ctk.CTkEntry(admin_new_pw_row, width=260, show="*", corner_radius=8, height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13))
+admin_new_pw_entry.pack(fill="x", expand=True)
+attach_password_toggle(admin_new_pw_entry, admin_new_pw_row)
 
 ctk.CTkButton(update_frame, text="Update Password", width=180, height=40, fg_color=PALETTE_PRIMARY, hover_color=PALETTE_DARKEST, text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14, weight="bold"), corner_radius=8, command=update_admin_password).grid(row=5, column=0, columnspan=2, padx=10, pady=(14, 6), sticky="w")
 
-# Create Subordinate Admin Section
 create_frame = ctk.CTkFrame(
     admin_panel,
     fg_color=PALETTE_DARK,
@@ -1009,18 +1243,22 @@ sub_user_entry = ctk.CTkEntry(create_frame, width=220, height=40, fg_color=PALET
 sub_user_entry.grid(row=2, column=1, padx=(8, 10), pady=8, sticky="ew")
 
 ctk.CTkLabel(create_frame, text="Password:", fg_color="transparent", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14, weight="bold")).grid(row=3, column=0, padx=(10, 8), pady=8, sticky="e")
-sub_pw_entry = ctk.CTkEntry(create_frame, width=220, show="*", height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13), corner_radius=8)
-sub_pw_entry.grid(row=3, column=1, padx=(8, 10), pady=8, sticky="ew")
+sub_pw_row = ctk.CTkFrame(create_frame, fg_color="transparent")
+sub_pw_row.grid(row=3, column=1, padx=(8, 10), pady=8, sticky="ew")
+sub_pw_entry = ctk.CTkEntry(sub_pw_row, width=220, show="*", height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13), corner_radius=8)
+sub_pw_entry.pack(fill="x", expand=True)
+attach_password_toggle(sub_pw_entry, sub_pw_row)
 
 ctk.CTkLabel(create_frame, text="Confirm Password:", fg_color="transparent", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14, weight="bold")).grid(row=4, column=0, padx=(10, 8), pady=8, sticky="e")
-sub_conf_pw_entry = ctk.CTkEntry(create_frame, width=220, show="*", height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13), corner_radius=8)
-sub_conf_pw_entry.grid(row=4, column=1, padx=(8, 10), pady=8, sticky="ew")
+sub_conf_pw_row = ctk.CTkFrame(create_frame, fg_color="transparent")
+sub_conf_pw_row.grid(row=4, column=1, padx=(8, 10), pady=8, sticky="ew")
+sub_conf_pw_entry = ctk.CTkEntry(sub_conf_pw_row, width=220, show="*", height=40, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, font=ctk.CTkFont(family="Segoe UI", size=13), corner_radius=8)
+sub_conf_pw_entry.pack(fill="x", expand=True)
+attach_password_toggle(sub_conf_pw_entry, sub_conf_pw_row)
 
 ctk.CTkButton(create_frame, text="Create Sub-Admin", width=180, height=40, fg_color=PALETTE_MINT, hover_color=PALETTE_PRIMARY, text_color=PALETTE_DARKEST, font=ctk.CTkFont(size=13, weight="bold"), command=create_sub_admin).grid(row=5, column=0, columnspan=2, sticky="w", padx=10, pady=(14, 6))
 
-# ---------------------------------------
 
-# false mean di resizable or na mamaximize yung window
 def on_admin_app_close():
     close_session_connection("admin-ui")
     try:
@@ -1031,6 +1269,9 @@ def on_admin_app_close():
 
 window.protocol("WM_DELETE_WINDOW", on_admin_app_close)
 window.resizable(True, True)
-print(f"[startup] Admin UI ready: {time.perf_counter() - APP_START_TS:.3f}s")
+logger.info(
+    "Admin UI ready",
+    extra={"duration_seconds": round(time.perf_counter() - APP_START_TS, 3)},
+)
 window.mainloop() 
  

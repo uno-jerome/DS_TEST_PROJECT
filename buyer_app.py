@@ -1,10 +1,13 @@
 import os
+import logging
 import tkinter as tk
 from tkinter import ttk, messagebox
 import customtkinter as ctk
 import time
+import random
+import re
 from datetime import datetime, timedelta
-from database import connectDB, setup_database, get_session_connection, close_session_connection
+from database import setup_database, get_session_connection, close_session_connection
 from services import buyer_data_service as buyer_data
 from services import buyer_state_service as buyer_state
 from services import buyer_utils
@@ -16,10 +19,17 @@ from security_utils import (
     verify_password,
 )
 
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
+
 SHOP_START_TS = time.perf_counter()
 db_setup_start = time.perf_counter()
 setup_database()
-print(f"[startup] Shop DB setup check: {time.perf_counter() - db_setup_start:.3f}s")
+logger.info(
+    "Shop DB setup check complete",
+    extra={"duration_seconds": round(time.perf_counter() - db_setup_start, 3)},
+)
 
 Image = None
 try:
@@ -28,7 +38,6 @@ try:
 except Exception:
     Image = None
 
-# Configure CustomTkinter appearance
 ctk.set_appearance_mode("Dark")
 ctk.set_default_color_theme("green")
 
@@ -40,12 +49,38 @@ PALETTE_TEXT = "#E8FFF5"
 SHOP_STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shop_state.json")
 MAX_LOGIN_ATTEMPTS = 5
 LOGIN_LOCK_MINUTES = 15
+MIN_ORDER_ID = 100000000000
+MAX_ORDER_ID = 999999999999
+MAX_ORDER_ID_ATTEMPTS = 30
 SHOP_READ_SESSION = "shop-read"
 SHOP_AUTH_SESSION = "shop-auth"
+EYE_ICON_FALLBACK = "👁"
 
-# Current user session variable
+
+def load_eye_toggle_icons():
+    if Image is None:
+        return None, None
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    open_icon_path = os.path.join(script_dir, "open_eye.png")
+    closed_icon_path = os.path.join(script_dir, "closed_eye.png")
+
+    try:
+        open_icon_img = Image.open(open_icon_path)
+        closed_icon_img = Image.open(closed_icon_path)
+    except Exception:
+        return None, None
+
+    open_icon = ctk.CTkImage(light_image=open_icon_img, dark_image=open_icon_img, size=(12, 12))
+    closed_icon = ctk.CTkImage(light_image=closed_icon_img, dark_image=closed_icon_img, size=(12, 12))
+    return open_icon, closed_icon
+
+
+OPEN_EYE_ICON, CLOSED_EYE_ICON = load_eye_toggle_icons()
+
 current_customer = {
     "id": None,
+    "username": None,
     "email": None,
     "name": None,
     "contact": None,
@@ -60,28 +95,73 @@ def load_shop_state():
 
 def save_shop_state():
     if not buyer_state.save_shop_state(SHOP_STATE_FILE, shop_state):
-        print("Warning: Could not save shop state.")
+        logger.warning("Could not save shop state")
 
 def get_current_cart_owner_key():
     owner_email = str(current_customer.get("email") or "").strip().lower()
     return owner_email
 
-def persist_login_preference(email, remember_me_enabled):
+def persist_login_preference(login_identifier, remember_me_enabled):
+    normalized_identifier = str(login_identifier or "").strip()
     if remember_me_enabled:
         shop_state["remember_me"] = True
-        shop_state["remembered_email"] = email
+        shop_state["remembered_login_identifier"] = normalized_identifier
+        shop_state["remembered_email"] = normalized_identifier
     else:
         shop_state["remember_me"] = False
+        shop_state["remembered_login_identifier"] = ""
         shop_state["remembered_email"] = ""
     save_shop_state()
 
 def restore_login_preference():
     remember_flag = bool(shop_state.get("remember_me", False))
-    remembered_email = str(shop_state.get("remembered_email", "") or "").strip()
+    remembered_identifier = str(
+        shop_state.get("remembered_login_identifier", shop_state.get("remembered_email", "")) or ""
+    ).strip()
 
     remember_me_var.set(remember_flag)
-    if remember_flag and remembered_email:
-        login_email_var.set(remembered_email)
+    if remember_flag and remembered_identifier:
+        login_email_var.set(remembered_identifier)
+
+
+def looks_like_phone_identifier(value):
+    raw_value = str(value or "").strip()
+    if not raw_value or "@" in raw_value:
+        return False
+
+    allowed_chars = set("0123456789+ -()")
+    if any(char not in allowed_chars for char in raw_value):
+        return False
+
+    digit_count = sum(1 for char in raw_value if char.isdigit())
+    return digit_count >= 10
+
+
+def build_contact_login_variants(value):
+    digits_only = "".join(char for char in str(value or "") if char.isdigit())
+    if not digits_only:
+        return []
+
+    variants = {digits_only}
+    if digits_only.startswith("63") and len(digits_only) == 12:
+        variants.add("0" + digits_only[2:])
+        variants.add(digits_only[2:])
+    elif digits_only.startswith("0") and len(digits_only) == 11:
+        variants.add("63" + digits_only[1:])
+        variants.add(digits_only[1:])
+    elif len(digits_only) == 10:
+        variants.add("63" + digits_only)
+        variants.add("0" + digits_only)
+
+    return sorted(variant for variant in variants if variant)
+
+
+def generate_unique_order_id(conn):
+    for _ in range(MAX_ORDER_ID_ATTEMPTS):
+        generated_order_id = random.randint(MIN_ORDER_ID, MAX_ORDER_ID)
+        if not buyer_data.order_id_exists(conn, generated_order_id):
+            return generated_order_id
+    raise RuntimeError("Could not generate a unique order ID. Please try checkout again.")
 
 def persist_cart_cache_for_current_user():
     owner_key = get_current_cart_owner_key()
@@ -142,7 +222,6 @@ def restore_cart_cache_for_current_user():
     refresh_cart_display(save_cache=False)
 
 def center_window(win, width, height):
-    # Center a window on the screen
     screen_width = win.winfo_screenwidth()
     screen_height = win.winfo_screenheight()
     x = (screen_width / 2) - (width / 2)
@@ -170,23 +249,20 @@ def maximize_window(win):
     except Exception:
         pass
 
-# Initialize Main Shop Window (Hidden Initially)
+
 shop = ctk.CTk()
+shop.withdraw()
 shop.title("E-Commerce User Storefront")
 center_window(shop, 1260, 840)
 shop.minsize(1100, 760)
-maximize_window(shop)
 shop.configure(fg_color=PALETTE_DARKEST)
-shop.withdraw()
 
-# --- Customer Auth UI Gateway ---
 auth_win = ctk.CTkToplevel(shop)
 auth_win.configure(fg_color=PALETTE_DARK)
 auth_win.title("Welcome to ITC Tech Store")
 center_window(auth_win, 450, 550)
 auth_win.attributes("-topmost", True)
 
-# Add a notebook for Login vs Register
 auth_notebook = ctk.CTkTabview(
     auth_win,
     width=400,
@@ -205,12 +281,13 @@ auth_notebook.pack(padx=14, pady=14, fill="both", expand=True)
 login_tab = auth_notebook.add("Login")
 register_tab = auth_notebook.add("Register")
 
-# Variables for auth
 login_email_var = tk.StringVar()
 login_pw_var = tk.StringVar()
 remember_me_var = tk.BooleanVar(value=False)
+login_hint_var = tk.StringVar(value="")
 
 reg_email_var = tk.StringVar()
+reg_username_var = tk.StringVar()
 reg_pw_var = tk.StringVar()
 reg_name_var = tk.StringVar()
 reg_contact_var = tk.StringVar()
@@ -219,11 +296,13 @@ shop_state = load_shop_state()
 
 auth_session_start = time.perf_counter()
 if get_session_connection(SHOP_AUTH_SESSION):
-    print(f"[startup] Shop auth session ready: {(time.perf_counter() - auth_session_start) * 1000:.1f}ms")
+    logger.info(
+        "Shop auth session ready",
+        extra={"duration_ms": round((time.perf_counter() - auth_session_start) * 1000, 1)},
+    )
 else:
-    print("[startup] Shop auth session unavailable (will retry on login).")
+    logger.warning("Shop auth session unavailable; will retry on login")
 
-# Font config
 MAIN_FONT = ("Segoe UI", 10)
 TITLE_FONT = ("Segoe UI", 16, "bold")
 BTN_BG = "#0e62a0"
@@ -231,10 +310,11 @@ BTN_FG = "white"
 
 def handle_login():
     login_start = time.perf_counter()
-    email = login_email_var.get().strip().lower()
+    login_identifier = login_email_var.get().strip()
     pw = login_pw_var.get().strip()
-    if not email or not pw:
-        messagebox.showwarning("Error", "Please enter both email and password", parent=auth_win)
+    login_hint_var.set("")
+    if not login_identifier or not pw:
+        messagebox.showwarning("Error", "Please enter your username, email, or phone and password", parent=auth_win)
         return
 
     try:
@@ -243,13 +323,22 @@ def handle_login():
             messagebox.showerror("Error", "Database connection is unavailable.", parent=auth_win)
             return
 
-        user = buyer_data.fetch_customer_for_login(conn, email)
+        normalized_identifier = login_identifier.strip()
+        user = buyer_data.fetch_customer_for_email_or_username(conn, normalized_identifier)
+
+        if not user and looks_like_phone_identifier(normalized_identifier):
+            contact_variants = build_contact_login_variants(normalized_identifier)
+            matching_customers = buyer_data.fetch_customers_by_contact_variants(conn, contact_variants)
+            if len(matching_customers) > 1:
+                login_hint_var.set("This phone number has multiple accounts. Use your email or username to log in.")
+                return
+            user = matching_customers[0] if matching_customers else None
 
         if not user:
-            messagebox.showerror("Login Failed", "Invalid email or password", parent=auth_win)
+            messagebox.showerror("Login Failed", "Invalid username, email, phone, or password", parent=auth_win)
             return
 
-        customer_id, db_email, db_name, db_contact, db_address, db_password_hash, failed_count, account_locked, locked_until = user
+        customer_id, db_username, db_email, db_name, db_contact, db_address, db_password_hash, failed_count, account_locked, locked_until = user
         current_time = datetime.now()
 
         if account_locked and locked_until and locked_until > current_time:
@@ -278,7 +367,7 @@ def handle_login():
                 remaining_attempts = MAX_LOGIN_ATTEMPTS - new_failed_count
                 messagebox.showerror(
                     "Login Failed",
-                    f"Invalid email or password. {remaining_attempts} attempt(s) left.",
+                    f"Invalid username, email, phone, or password. {remaining_attempts} attempt(s) left.",
                     parent=auth_win,
                 )
             return
@@ -290,46 +379,59 @@ def handle_login():
             buyer_data.reset_customer_login_status(conn, customer_id)
         conn.commit()
 
-        # Set global session
         current_customer['id'] = customer_id
+        current_customer['username'] = db_username
         current_customer['email'] = db_email
         current_customer['name'] = db_name
         current_customer['contact'] = db_contact
         current_customer['address'] = db_address
 
-        persist_login_preference(email, remember_me_var.get())
-
-        auth_win.lift()
-        auth_win.focus_force()
-        messagebox.showinfo("Welcome", f"Welcome back, {db_name}!", parent=auth_win)
-        auth_win.withdraw()
+        persist_login_preference(normalized_identifier, remember_me_var.get())
         
-        # Update checkout UI with user info passively
         checkout_name_lbl.configure(text=f"{current_customer['name']}")
         checkout_email_lbl.configure(text=f"{current_customer['email']}")
         checkout_contact_lbl.configure(text=f"{current_customer['contact']}")
         checkout_addr_lbl.configure(text=f"{current_customer['address']}")
 
-        shop.deiconify() # Display shop
+        auth_win.configure(cursor="watch")
+        auth_win.update_idletasks()
+        try:
+            filter_products()
+            restore_cart_cache_for_current_user()
+        finally:
+            auth_win.configure(cursor="")
+
+        auth_win.withdraw()
+        shop.deiconify()
         maximize_window(shop)
+        shop.update_idletasks()
         shop.lift()
         shop.focus_force()
-
-        # Defer cart cache restore until after UI is visible for better perceived login speed.
-        shop.after_idle(restore_cart_cache_for_current_user)
-        print(f"[perf] Buyer login flow: {(time.perf_counter() - login_start) * 1000:.1f}ms")
+        logger.debug(
+            "Buyer login flow completed",
+            extra={"duration_ms": round((time.perf_counter() - login_start) * 1000, 1)},
+        )
     except Exception as e:
         messagebox.showerror("Error", f"Database error: {e}", parent=auth_win)
 
 def handle_register():
     email = reg_email_var.get().strip().lower()
+    username = reg_username_var.get().strip()
     pw = reg_pw_var.get().strip()
     name = reg_name_var.get().strip()
     contact_raw = reg_contact_var.get().strip()
     address = reg_addr_text.get("1.0", tk.END).strip()
     
-    if not email or not pw or not name or not contact_raw or not address:
+    if not email or not username or not pw or not name or not contact_raw or not address:
         messagebox.showwarning("Error", "Please fill out all fields", parent=auth_win)
+        return
+
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{3,50}", username):
+        messagebox.showwarning(
+            "Error",
+            "Username must be 3-50 characters and use only letters, numbers, dot, underscore, or dash.",
+            parent=auth_win,
+        )
         return
         
     if "@" not in email or "." not in email:
@@ -346,6 +448,7 @@ def handle_register():
         return
         
     contact = "+63" + contact_raw
+    contact_variants = build_contact_login_variants(contact)
     hashed_pw = hash_password(pw)
     
     try:
@@ -358,25 +461,86 @@ def handle_register():
             messagebox.showerror("Error", "Email is already registered", parent=auth_win)
             return
 
-        buyer_data.insert_customer(conn, email, hashed_pw, name, contact, address)
+        if buyer_data.customer_exists_by_username(conn, username):
+            messagebox.showerror("Error", "Username is already taken", parent=auth_win)
+            return
+
+        if buyer_data.customer_exists_by_contact_variants(conn, contact_variants):
+            messagebox.showerror("Error", "Contact number is already registered", parent=auth_win)
+            return
+
+        buyer_data.insert_customer(conn, email, username, hashed_pw, name, contact, address)
         conn.commit()
         
         messagebox.showinfo("Success", "Registration complete! You can now log in.", parent=auth_win)
         auth_notebook.set("Login")
-        login_email_var.set(email)
+        login_email_var.set(username)
         login_pw_var.set("")
     except Exception as e:
         messagebox.showerror("Error", f"Registration error: {e}", parent=auth_win)
 
-# --- Login UI ---
 ctk.CTkLabel(login_tab, text="Welcome Back!", font=ctk.CTkFont(size=26, weight="bold"), text_color=PALETTE_MINT).pack(pady=(20, 20))
-ctk.CTkLabel(login_tab, text="Email Address", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).pack(anchor="w", padx=40)
+ctk.CTkLabel(login_tab, text="Username, Email, or Phone", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).pack(anchor="w", padx=40)
 
-login_email_entry = ctk.CTkEntry(login_tab, textvariable=login_email_var, width=320, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text_color="#7FB8A3")
+login_email_entry = ctk.CTkEntry(login_tab, textvariable=login_email_var, width=320, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text="Enter username, email, or phone", placeholder_text_color="#7FB8A3")
 login_email_entry.pack(padx=40, pady=(5,10))
 ctk.CTkLabel(login_tab, text="Password", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).pack(anchor="w", padx=40, pady=(15, 5))
-login_password_entry = ctk.CTkEntry(login_tab, textvariable=login_pw_var, show="•", width=320, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text_color="#7FB8A3")
-login_password_entry.pack(padx=40, pady=(5,10))
+login_password_row = ctk.CTkFrame(login_tab, fg_color="transparent")
+login_password_row.pack(padx=40, pady=(5,10), fill="x")
+login_password_entry = ctk.CTkEntry(login_password_row, textvariable=login_pw_var, show="*", width=250, height=45, corner_radius=10, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT, placeholder_text_color="#7FB8A3")
+login_password_entry.pack(fill="x", expand=True)
+
+
+def set_password_toggle_icon(toggle_button, is_visible):
+    if OPEN_EYE_ICON and CLOSED_EYE_ICON:
+        toggle_button.configure(image=OPEN_EYE_ICON if is_visible else CLOSED_EYE_ICON, text="")
+    else:
+        toggle_button.configure(image=None, text=EYE_ICON_FALLBACK)
+
+
+def toggle_login_password_visibility():
+    if login_password_entry.cget("show") == "":
+        login_password_entry.configure(show="*")
+        login_password_toggle_btn.configure(fg_color=PALETTE_DARKEST)
+        set_password_toggle_icon(login_password_toggle_btn, False)
+    else:
+        login_password_entry.configure(show="")
+        login_password_toggle_btn.configure(fg_color=PALETTE_PRIMARY)
+        set_password_toggle_icon(login_password_toggle_btn, True)
+
+
+login_password_toggle_btn = ctk.CTkButton(
+    login_password_row,
+    text="",
+    image=CLOSED_EYE_ICON,
+    width=20,
+    height=20,
+    corner_radius=6,
+    fg_color=PALETTE_DARKEST,
+    hover_color=PALETTE_DARK,
+    text_color=PALETTE_TEXT,
+    font=ctk.CTkFont(size=9),
+    command=toggle_login_password_visibility,
+)
+login_password_toggle_btn.place(relx=1.0, rely=0.5, x=-14, anchor="e")
+set_password_toggle_icon(login_password_toggle_btn, False)
+
+login_hint_label = ctk.CTkLabel(
+    login_tab,
+    textvariable=login_hint_var,
+    text_color="#FFD166",
+    font=ctk.CTkFont(size=12),
+    wraplength=320,
+    justify="left",
+)
+login_hint_label.pack(anchor="w", padx=40, pady=(2, 0))
+
+
+def clear_login_inline_hint(event=None):
+    if login_hint_var.get():
+        login_hint_var.set("")
+    return None
+
 ctk.CTkCheckBox(
     login_tab,
     text="Remember Me",
@@ -400,51 +564,85 @@ def handle_login_enter(event=None):
 
 login_email_entry.bind("<Return>", handle_login_enter)
 login_password_entry.bind("<Return>", handle_login_enter)
+login_email_entry.bind("<KeyRelease>", clear_login_inline_hint)
+login_password_entry.bind("<KeyRelease>", clear_login_inline_hint)
 auth_win.bind("<Return>", handle_login_enter)
 
 restore_login_preference()
 
-# --- Register UI ---
 ctk.CTkLabel(register_tab, text="Email:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=0, column=0, sticky="e", padx=10, pady=10)
 ctk.CTkEntry(register_tab, textvariable=reg_email_var, width=240, height=35, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT).grid(row=0, column=1)
 
-ctk.CTkLabel(register_tab, text="Password:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=1, column=0, sticky="e", padx=10, pady=10)
-ctk.CTkEntry(register_tab, textvariable=reg_pw_var, show="*", width=240, height=35, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT).grid(row=1, column=1)
+ctk.CTkLabel(register_tab, text="Username:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=1, column=0, sticky="e", padx=10, pady=10)
+ctk.CTkEntry(register_tab, textvariable=reg_username_var, width=240, height=35, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT).grid(row=1, column=1)
 
-ctk.CTkLabel(register_tab, text="Full Name:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=2, column=0, sticky="e", padx=10, pady=10)
-ctk.CTkEntry(register_tab, textvariable=reg_name_var, width=240, height=35, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT).grid(row=2, column=1)
+ctk.CTkLabel(register_tab, text="Password:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=2, column=0, sticky="e", padx=10, pady=10)
+register_password_row = ctk.CTkFrame(register_tab, fg_color="transparent")
+register_password_row.grid(row=2, column=1, sticky="ew")
+reg_password_entry = ctk.CTkEntry(register_password_row, textvariable=reg_pw_var, show="*", width=240, height=35, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT)
+reg_password_entry.pack(fill="x", expand=True)
 
-ctk.CTkLabel(register_tab, text="Contact (+63):", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=3, column=0, sticky="e", padx=10, pady=10)
+
+def toggle_register_password_visibility():
+    if reg_password_entry.cget("show") == "":
+        reg_password_entry.configure(show="*")
+        register_password_toggle_btn.configure(fg_color=PALETTE_DARKEST)
+        set_password_toggle_icon(register_password_toggle_btn, False)
+    else:
+        reg_password_entry.configure(show="")
+        register_password_toggle_btn.configure(fg_color=PALETTE_PRIMARY)
+        set_password_toggle_icon(register_password_toggle_btn, True)
+
+
+register_password_toggle_btn = ctk.CTkButton(
+    register_password_row,
+    text="",
+    image=CLOSED_EYE_ICON,
+    width=20,
+    height=20,
+    corner_radius=6,
+    fg_color=PALETTE_DARKEST,
+    hover_color=PALETTE_DARK,
+    text_color=PALETTE_TEXT,
+    font=ctk.CTkFont(size=9),
+    command=toggle_register_password_visibility,
+)
+register_password_toggle_btn.place(relx=1.0, rely=0.5, x=-11, anchor="e")
+set_password_toggle_icon(register_password_toggle_btn, False)
+
+ctk.CTkLabel(register_tab, text="Full Name:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=3, column=0, sticky="e", padx=10, pady=10)
+ctk.CTkEntry(register_tab, textvariable=reg_name_var, width=240, height=35, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT).grid(row=3, column=1)
+
+ctk.CTkLabel(register_tab, text="Contact (+63):", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=4, column=0, sticky="e", padx=10, pady=10)
 reg_contact_entry = ctk.CTkEntry(register_tab, textvariable=reg_contact_var, width=240, height=35, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, text_color=PALETTE_MINT)
-reg_contact_entry.grid(row=3, column=1)
+reg_contact_entry.grid(row=4, column=1)
 
-ctk.CTkLabel(register_tab, text="Address:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=4, column=0, sticky="ne", padx=10, pady=10)
+ctk.CTkLabel(register_tab, text="Address:", text_color=PALETTE_TEXT, font=ctk.CTkFont(size=14)).grid(row=5, column=0, sticky="ne", padx=10, pady=10)
 reg_addr_text = ctk.CTkTextbox(register_tab, width=240, height=80, corner_radius=8, fg_color=PALETTE_DARKEST, border_color=PALETTE_PRIMARY, border_width=1, text_color=PALETTE_MINT)
-reg_addr_text.grid(row=4, column=1, pady=10)
+reg_addr_text.grid(row=5, column=1, pady=10)
 
-ctk.CTkButton(register_tab, text="Create Account", font=ctk.CTkFont(size=15, weight="bold"), fg_color=PALETTE_MINT, hover_color=PALETTE_PRIMARY, text_color=PALETTE_DARKEST, command=handle_register, width=240, height=45, corner_radius=10).grid(row=5, columnspan=2, pady=15)
+ctk.CTkButton(register_tab, text="Create Account", font=ctk.CTkFont(size=15, weight="bold"), fg_color=PALETTE_MINT, hover_color=PALETTE_PRIMARY, text_color=PALETTE_DARKEST, command=handle_register, width=240, height=45, corner_radius=10).grid(row=6, columnspan=2, pady=15)
 
-# --- Shop Application Layout below ---
 
-cart_items = []  # To store the items added to the cart
+cart_items = []
 subtotal_var = tk.DoubleVar(value=0.0)
 vat_var = tk.DoubleVar(value=0.0)
 grand_total_var = tk.DoubleVar(value=0.0)
-subtotal_display_var = tk.StringVar(value="₱ 0.00")
-vat_display_var = tk.StringVar(value="₱ 0.00")
-grand_total_display_var = tk.StringVar(value="₱ 0.00")
+subtotal_display_var = tk.StringVar(value="PHP 0.00")
+vat_display_var = tk.StringVar(value="PHP 0.00")
+grand_total_display_var = tk.StringVar(value="PHP 0.00")
 payment_method_var = tk.StringVar(value="Cash")
 first_product_load_logged = False
 
-# Fetch Stock from Database
 def load_products(search_term="", category="All Categories"):
     global first_product_load_logged
 
     load_start = time.perf_counter()
     loaded_rows_count = 0
 
-    for data in products_tree.get_children():
-        products_tree.delete(data)
+    existing_rows = products_tree.get_children()
+    if existing_rows:
+        products_tree.delete(*existing_rows)
         
     try:
         conn = get_session_connection(SHOP_READ_SESSION)
@@ -465,7 +663,10 @@ def load_products(search_term="", category="All Categories"):
     finally:
         if not first_product_load_logged:
             elapsed_ms = (time.perf_counter() - load_start) * 1000
-            print(f"[perf] Shop first product load: {elapsed_ms:.1f}ms ({loaded_rows_count} rows)")
+            logger.debug(
+                "Shop first product load completed",
+                extra={"duration_ms": round(elapsed_ms, 1), "rows_loaded": loaded_rows_count},
+            )
             first_product_load_logged = True
 
 def filter_products():
@@ -514,7 +715,6 @@ def show_product_details(show_warning=True):
     image_column = ctk.CTkFrame(container, fg_color=PALETTE_DARKEST, corner_radius=10)
     image_column.grid(row=0, column=0, sticky="n", padx=(0, 14), pady=(8, 4))
 
-    # Keep image container square (1:1) for consistent product preview.
     image_square = ctk.CTkFrame(image_column, width=320, height=320, fg_color=PALETTE_DARK, corner_radius=8)
     image_square.pack(padx=12, pady=12)
     image_square.pack_propagate(False)
@@ -600,7 +800,6 @@ def show_product_details(show_warning=True):
         command=details_win.destroy,
     ).pack(side="left")
 
-# Add Selected Item to Cart
 def add_to_cart():
     try:
         selected_item = products_tree.selection()[0]
@@ -653,27 +852,25 @@ def add_to_cart():
         messagebox.showwarning("Error", "Please select a product from the list to add.")
 
 def refresh_cart_display(save_cache=True):
-    # Clear current display
-    for data in cart_tree.get_children():
-        cart_tree.delete(data)
+    existing_rows = cart_tree.get_children()
+    if existing_rows:
+        cart_tree.delete(*existing_rows)
         
     total = 0.0
     for idx, item in enumerate(cart_items):
-        cart_tree.insert(parent='', index='end', iid=str(idx), values=(item['name'], f"₱{item['price']:,.2f}", item['quantity'], f"₱{item['subtotal']:,.2f}"))
+        cart_tree.insert(parent='', index='end', iid=str(idx), values=(item['name'], f"PHP {item['price']:,.2f}", item['quantity'], f"PHP {item['subtotal']:,.2f}"))
         total += item['subtotal']
             
     subtotal_var.set(round(total, 2))
-    subtotal_display_var.set(f"₱ {total:,.2f}")
+    subtotal_display_var.set(f"PHP {total:,.2f}")
         
-    # Calculate 12% VAT
     vat = total * 0.12
     vat_var.set(round(vat, 2))
-    vat_display_var.set(f"₱ {vat:,.2f}")
+    vat_display_var.set(f"PHP {vat:,.2f}")
         
-    # Calculate Grand Total
     grand_total = total + vat
     grand_total_var.set(round(grand_total, 2))
-    grand_total_display_var.set(f"₱ {grand_total:,.2f}")
+    grand_total_display_var.set(f"PHP {grand_total:,.2f}")
 
     if save_cache:
         persist_cart_cache_for_current_user()
@@ -681,7 +878,6 @@ def refresh_cart_display(save_cache=True):
 def remove_from_cart(require_confirmation=False):
     try:
         selected_item = cart_tree.selection()[0]
-        # The iid of the treeview items is mapped to the index of cart_items array
         idx = int(selected_item)
         removed_name = cart_items[idx]['name']
 
@@ -724,13 +920,12 @@ def show_digital_receipt(filename):
         with open(filename, "r") as file:
             content = file.read()
             txt.insert("1.0", content)
-            txt.configure(state="disabled") # Prevent user from editing receipt
+            txt.configure(state="disabled")
     except Exception as e:
         txt.insert("1.0", f"Error loading receipt: {e}")
         
     ctk.CTkButton(receipt_win, text="Close Receipt", fg_color=PALETTE_PRIMARY, hover_color=PALETTE_DARKEST, text_color=PALETTE_TEXT, font=ctk.CTkFont(size=12), command=receipt_win.destroy).pack(pady=10)
     
-    # Make the app wait for the receipt to be closed before continuing
     receipt_win.grab_set()
     shop.wait_window(receipt_win)
 
@@ -745,6 +940,7 @@ def checkout():
         return
         
     customer_email = current_customer['email']
+    customer_username = current_customer['username']
     customer_name = current_customer['name']
     customer_address = current_customer['address']
     contact_number = current_customer['contact']
@@ -754,23 +950,30 @@ def checkout():
         return
 
     conn = None
+    try:
+        checkout_button.configure(state="disabled", text="Processing Checkout...")
+    except Exception:
+        pass
+    shop.update_idletasks()
     
     try:
-        conn = connectDB()
+        conn = get_session_connection(SHOP_AUTH_SESSION)
         if not conn:
             messagebox.showerror("Checkout Error", "Database connection is unavailable.")
             return
 
-        # 1. Create the Order
         subtotal = subtotal_var.get()
         vat = vat_var.get()
         grand_total = grand_total_var.get()
 
         order_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        order_id = generate_unique_order_id(conn)
 
         order_id = buyer_data.create_order(
             conn,
+            order_id,
             customer_name,
+            customer_username,
             customer_email,
             contact_number,
             customer_address,
@@ -782,17 +985,17 @@ def checkout():
             "Pending",
         )
         
-        # 2. Insert Order Items and Update Stock
         for item in cart_items:
-            # Insert item history
             buyer_data.insert_order_item(conn, order_id, item['item_id'], item['quantity'], item['price'])
             
-            # Deduct stock (Update Query)
-            buyer_data.decrement_stock(conn, item['item_id'], item['quantity'])
+            stock_rows_updated = buyer_data.decrement_stock(conn, item['item_id'], item['quantity'])
+            if stock_rows_updated != 1:
+                raise ValueError(
+                    f"Not enough stock left for '{item['name']}'. Please refresh and review your cart."
+                )
             
         conn.commit()
         
-        # 3. Generate receipt file.
         receipt_filename = f"receipt_ORD{order_id}.txt"
         try:
             receipt_filename = buyer_utils.write_receipt_file(
@@ -809,37 +1012,36 @@ def checkout():
                 cart_items,
             )
         except Exception as receipt_error:
-            print(f"Could not write receipt file: {receipt_error}")
+            logger.error("Could not write receipt file", extra={"error": str(receipt_error)})
         
-        # 4. Display Receipt pop-up to user
         show_digital_receipt(receipt_filename)
         
         messagebox.showinfo("Success", "Checkout successful! Receipt generated. Thank you for your order.")
         
-        # Reset cart and UI
         cart_items.clear()
         refresh_cart_display()
         search_entry.delete(0, tk.END)
         shop_category_var.set("All Categories")
-        filter_products() # Refresh available stock in treeview
+        shop.after_idle(filter_products)
         
     except Exception as e:
         if conn:
             conn.rollback()
         messagebox.showerror("Checkout Error", f"An error occurred during checkout: {e}")
     finally:
-        if conn:
-            conn.close()
+        try:
+            checkout_button.configure(state="normal", text="Checkout")
+        except Exception:
+            pass
 
 def my_orders():
     email = current_customer['email']
     if not email:
         messagebox.showerror("Error", "You must be logged in to view your orders.")
         return
-        
-    conn = None
+
     try:
-        conn = connectDB()
+        conn = get_session_connection(SHOP_AUTH_SESSION)
         if not conn:
             messagebox.showerror("Database Error", "Database connection is unavailable.")
             return
@@ -876,23 +1078,19 @@ def my_orders():
             messagebox.showinfo("No Orders Found", "You haven't placed any orders yet.")
     except Exception as e:
         messagebox.showerror("Database Error", f"Could not retrieve orders: {e}")
-    finally:
-        if conn:
-            conn.close()
 
 def logout():
     decision =messagebox.askyesno("Logout", "Are you sure you want to log out?")
     if decision:
         shop.withdraw()
         
-        # Reset Session
         current_customer['id'] = None
+        current_customer['username'] = None
         current_customer['email'] = None
         current_customer['name'] = None
         current_customer['contact'] = None
         current_customer['address'] = None
         
-        # Reset Cart
         cart_items.clear()
         refresh_cart_display(save_cache=False)
         
@@ -903,9 +1101,7 @@ def logout():
             auth_win.lift()
             auth_win.focus_force()
 
-# --- UI LAYOUT ---
 
-# Top Banner
 header_frame = ctk.CTkFrame(shop, fg_color=PALETTE_DARK, height=60, corner_radius=0)
 header_frame.pack(fill="x")
 ctk.CTkLabel(header_frame, text="Store Dashboard", font=ctk.CTkFont(size=24, weight="bold"), text_color=PALETTE_MINT).pack(side="left", padx=20, pady=10)
@@ -916,13 +1112,11 @@ ctk.CTkButton(header_frame, text="My Orders", fg_color=PALETTE_MINT, hover_color
 main_frame = ctk.CTkFrame(shop, fg_color="transparent", corner_radius=0)
 main_frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-# Left Side: Product List
 left_frame = ctk.CTkFrame(main_frame, fg_color=PALETTE_DARK, corner_radius=10)
 left_frame.pack(side="left", fill="both", expand=True, padx=(0, 10))
 
 ctk.CTkLabel(left_frame, text="Shopping Menu", text_color=PALETTE_MINT, font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(15, 5))
 
-# Search & Filter Bar
 filter_frame = ctk.CTkFrame(left_frame, fg_color="transparent", corner_radius=15)
 filter_frame.pack(fill="x", padx=10)
 
@@ -951,7 +1145,6 @@ shop_category_combo.pack(side="left", padx=5)
 ctk.CTkButton(filter_frame, text="Filter", command=filter_products, width=80, font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"), corner_radius=10, fg_color=PALETTE_PRIMARY, hover_color=PALETTE_DARKEST, text_color=PALETTE_TEXT).pack(side="left", padx=10)
 
 products_tree = ttk.Treeview(left_frame, columns=("ID", "Name", "Price", "Qty", "Category"), show='headings', height=13)
-# Adding modern ttk style for treeview
 style = ttk.Style()
 style.theme_use("default")
 style.configure("Treeview.Heading", font=("Segoe UI", 11, "bold"), background=PALETTE_DARK, foreground=PALETTE_MINT)
@@ -972,7 +1165,6 @@ products_tree.column("Category", width=120)
 products_tree.pack(fill="both", expand=True, padx=10, pady=10)
 products_tree.bind("<Double-1>", lambda event: show_product_details(show_warning=False))
 
-# Product Actions
 add_frame = ctk.CTkFrame(left_frame, fg_color="transparent", corner_radius=15)
 add_frame.pack(fill="x", padx=10, pady=10)
 ctk.CTkLabel(add_frame, text="Qty:", text_color=PALETTE_TEXT).pack(side="left", padx=(10, 5))
@@ -982,7 +1174,6 @@ qty_entry.pack(side="left", padx=5)
 ctk.CTkButton(add_frame,  fg_color=PALETTE_MINT, hover_color=PALETTE_PRIMARY, text_color=PALETTE_DARKEST, font=ctk.CTkFont(weight="bold"), text="Add to Cart", command=add_to_cart, width=120).pack(side="left", padx=10)
 ctk.CTkButton(add_frame, fg_color=PALETTE_PRIMARY, hover_color=PALETTE_DARKEST, text_color=PALETTE_TEXT, font=ctk.CTkFont(weight="bold"), text="View Details", command=show_product_details, width=120).pack(side="left", padx=4)
 
-# Right Side: Shopping Cart
 right_frame = ctk.CTkScrollableFrame(main_frame, fg_color=PALETTE_DARK, corner_radius=10, width=520)
 right_frame.pack(side="right", fill="both", expand=True, padx=(10, 0))
 
@@ -1001,13 +1192,11 @@ cart_tree.column("Subtotal", width=80)
 cart_tree.pack(fill="both", expand=True, padx=10, pady=10)
 cart_tree.bind("<Delete>", remove_from_cart_with_prompt)
 
-# Cart Actions
 cart_action_frame = ctk.CTkFrame(right_frame, fg_color="transparent", corner_radius=15)
 cart_action_frame.pack(fill="x", padx=10)
 ctk.CTkButton(cart_action_frame,  fg_color="#ff4c4c", hover_color="#cc0000", text="Remove", command=remove_from_cart, font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"), corner_radius=10).pack(side="left", padx=5)
 ctk.CTkButton(cart_action_frame,  fg_color=PALETTE_DARKEST, hover_color=PALETTE_PRIMARY, text_color=PALETTE_TEXT, text="Clear", command=clear_cart, font=ctk.CTkFont(family="Segoe UI", size=14, weight="bold"), corner_radius=10).pack(side="right", padx=5)
 
-# Checkout Area
 checkout_frame = ctk.CTkFrame(right_frame, fg_color="transparent", corner_radius=15)
 checkout_frame.pack(fill="x", padx=10, pady=10)
 
@@ -1020,7 +1209,6 @@ ctk.CTkLabel(checkout_frame, textvariable=vat_display_var, text_color=PALETTE_MI
 ctk.CTkLabel(checkout_frame, text="Grand Total:", font=ctk.CTkFont(size=18, weight="bold"), text_color=PALETTE_MINT).grid(row=2, column=0, sticky="w", pady=(10,5))
 ctk.CTkLabel(checkout_frame, textvariable=grand_total_display_var, font=ctk.CTkFont(size=18, weight="bold"), text_color=PALETTE_MINT).grid(row=2, column=1, sticky="w", pady=(10,5))
 
-# Payment and Customer Details
 payment_frame = ctk.CTkFrame(right_frame, fg_color="transparent", corner_radius=8)
 payment_frame.pack(fill="x", padx=10)
 
@@ -1044,9 +1232,17 @@ ctk.CTkLabel(payment_frame, text="Address:", text_color=PALETTE_TEXT).grid(row=4
 checkout_addr_lbl = ctk.CTkLabel(payment_frame, text="[Address]", wraplength=260, justify="left", text_color=PALETTE_MINT)
 checkout_addr_lbl.grid(row=4, column=1, sticky="w", padx=5, pady=2)
 
-ctk.CTkButton(right_frame,  fg_color=PALETTE_MINT, hover_color=PALETTE_PRIMARY, text_color=PALETTE_DARKEST, font=ctk.CTkFont(size=14, weight="bold"), text="Checkout", command=checkout).pack(fill="x", padx=10, pady=10)
+checkout_button = ctk.CTkButton(
+    right_frame,
+    fg_color=PALETTE_MINT,
+    hover_color=PALETTE_PRIMARY,
+    text_color=PALETTE_DARKEST,
+    font=ctk.CTkFont(size=14, weight="bold"),
+    text="Checkout",
+    command=checkout,
+)
+checkout_button.pack(fill="x", padx=10, pady=10)
 
-# Initialize and run
 def on_shop_app_close():
     close_session_connection(SHOP_READ_SESSION)
     close_session_connection(SHOP_AUTH_SESSION)
@@ -1059,6 +1255,8 @@ def on_shop_app_close():
 shop.protocol("WM_DELETE_WINDOW", on_shop_app_close)
 auth_win.protocol("WM_DELETE_WINDOW", on_shop_app_close)
 
-print(f"[startup] Shop UI ready: {time.perf_counter() - SHOP_START_TS:.3f}s")
-filter_products()
+logger.info(
+    "Shop UI ready",
+    extra={"duration_seconds": round(time.perf_counter() - SHOP_START_TS, 3)},
+)
 shop.mainloop()

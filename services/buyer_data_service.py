@@ -1,20 +1,58 @@
 def _get_cursor(conn):
-    conn.ping(reconnect=True)
+    try:
+        conn.ping(True)
+    except TypeError:
+        conn.ping()
     return conn.cursor()
 
 
-def fetch_customer_for_login(conn, email):
+NORMALIZED_CONTACT_SQL = "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(contact_number, '+', ''), ' ', ''), '-', ''), '(', ''), ')', '')"
+
+
+def fetch_customer_for_email_or_username(conn, identifier):
     cur = _get_cursor(conn)
     cur.execute(
         """
-        SELECT id, email, name, contact_number, address, password_hash,
+        SELECT id, username, email, name, contact_number, address, password_hash,
                COALESCE(failed_login_count, 0), COALESCE(account_locked, 0), locked_until
         FROM customers
-        WHERE email = %s
+        WHERE LOWER(email) = LOWER(%s) OR LOWER(username) = LOWER(%s)
+        LIMIT 1
         """,
-        (email,),
+        (identifier, identifier),
     )
     return cur.fetchone()
+
+
+def fetch_customer_for_login_identifier(conn, identifier):
+    return fetch_customer_for_email_or_username(conn, identifier)
+
+
+def fetch_customers_by_contact_variants(conn, contact_variants):
+    if not contact_variants:
+        return []
+
+    normalized_variants = [str(value).strip() for value in contact_variants if str(value).strip()]
+    if not normalized_variants:
+        return []
+
+    placeholders = ", ".join(["%s"] * len(normalized_variants))
+    cur = _get_cursor(conn)
+    cur.execute(
+        f"""
+        SELECT id, username, email, name, contact_number, address, password_hash,
+               COALESCE(failed_login_count, 0), COALESCE(account_locked, 0), locked_until
+        FROM customers
+        WHERE {NORMALIZED_CONTACT_SQL} IN ({placeholders})
+        ORDER BY id ASC
+        """,
+        tuple(normalized_variants),
+    )
+    return cur.fetchall()
+
+
+def fetch_customers_for_contact_login(conn, contact_variants):
+    return fetch_customers_by_contact_variants(conn, contact_variants)
 
 
 def mark_customer_login_locked(conn, customer_id, failed_count, current_time, locked_until):
@@ -70,19 +108,42 @@ def customer_exists_by_email(conn, email):
     return cur.fetchone() is not None
 
 
-def insert_customer(conn, email, password_hash, name, contact_number, address):
+def customer_exists_by_username(conn, username):
+    cur = _get_cursor(conn)
+    cur.execute("SELECT username FROM customers WHERE LOWER(username)=LOWER(%s)", (username,))
+    return cur.fetchone() is not None
+
+
+def customer_exists_by_contact_variants(conn, contact_variants):
+    if not contact_variants:
+        return False
+
+    normalized_variants = [str(value).strip() for value in contact_variants if str(value).strip()]
+    if not normalized_variants:
+        return False
+
+    placeholders = ", ".join(["%s"] * len(normalized_variants))
+    cur = _get_cursor(conn)
+    cur.execute(
+        f"SELECT id FROM customers WHERE {NORMALIZED_CONTACT_SQL} IN ({placeholders}) LIMIT 1",
+        tuple(normalized_variants),
+    )
+    return cur.fetchone() is not None
+
+
+def insert_customer(conn, email, username, password_hash, name, contact_number, address):
     cur = _get_cursor(conn)
     cur.execute(
         """
-        INSERT INTO customers (email, password_hash, name, contact_number, address)
-        VALUES (%s, %s, %s, %s, %s)
+        INSERT INTO customers (email, username, password_hash, name, contact_number, address)
+        VALUES (%s, %s, %s, %s, %s, %s)
         """,
-        (email, password_hash, name, contact_number, address),
+        (email, username, password_hash, name, contact_number, address),
     )
 
 
 def fetch_available_products(conn, search_term="", category="All Categories"):
-    sql = "SELECT `item_id`, `name`, `price`, `quantity`, `category` FROM `stocks` WHERE `quantity` > 0"
+    sql = "SELECT `item_id`, `name`, `price`, `quantity`, `category` FROM `stocks` WHERE CAST(`quantity` AS DECIMAL(10,2)) > 0"
     params = []
 
     if category != "All Categories":
@@ -139,7 +200,9 @@ def fetch_product_details(conn, item_id):
 
 def create_order(
     conn,
+    order_id,
     customer_name,
+    customer_username,
     customer_email,
     contact_number,
     customer_address,
@@ -154,12 +217,14 @@ def create_order(
     cur.execute(
         """
         INSERT INTO orders (
-            customer_name, customer_email, contact_number, customer_address,
+            order_id, customer_name, customer_username, customer_email, contact_number, customer_address,
             total_amount, vat_amount, grand_total, payment_method, order_date, status
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
+            order_id,
             customer_name,
+            customer_username,
             customer_email,
             contact_number,
             customer_address,
@@ -171,7 +236,13 @@ def create_order(
             status,
         ),
     )
-    return cur.lastrowid
+    return order_id
+
+
+def order_id_exists(conn, order_id):
+    cur = _get_cursor(conn)
+    cur.execute("SELECT 1 FROM orders WHERE order_id = %s LIMIT 1", (order_id,))
+    return cur.fetchone() is not None
 
 
 def insert_order_item(conn, order_id, item_id, quantity, price):
@@ -185,15 +256,16 @@ def insert_order_item(conn, order_id, item_id, quantity, price):
 def decrement_stock(conn, item_id, quantity):
     cur = _get_cursor(conn)
     cur.execute(
-        "UPDATE stocks SET quantity = quantity - %s WHERE item_id = %s",
-        (quantity, item_id),
+        "UPDATE stocks SET quantity = CAST(quantity AS SIGNED) - %s WHERE item_id = %s AND CAST(quantity AS SIGNED) >= %s",
+        (quantity, item_id, quantity),
     )
+    return int(cur.rowcount)
 
 
 def fetch_customer_orders(conn, email):
     cur = _get_cursor(conn)
     cur.execute(
-        "SELECT order_id, order_date, grand_total, status FROM orders WHERE customer_email = %s ORDER BY order_id DESC",
+        "SELECT order_id, order_date, grand_total, status FROM orders WHERE customer_email = %s ORDER BY order_date DESC, order_id DESC",
         (email,),
     )
     return cur.fetchall()

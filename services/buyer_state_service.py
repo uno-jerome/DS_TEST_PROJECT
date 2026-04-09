@@ -6,6 +6,7 @@ def default_shop_state():
     return {
         "remember_me": False,
         "remembered_email": "",
+        "remembered_login_identifier": "",
         "cart_cache": {},
     }
 
@@ -22,6 +23,7 @@ def load_shop_state(state_file_path):
 
             loaded_state.setdefault("remember_me", False)
             loaded_state.setdefault("remembered_email", "")
+            loaded_state.setdefault("remembered_login_identifier", loaded_state.get("remembered_email", ""))
             loaded_state.setdefault("cart_cache", {})
 
             if not isinstance(loaded_state["cart_cache"], dict):
